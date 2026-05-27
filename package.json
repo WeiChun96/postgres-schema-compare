@@ -1,0 +1,284 @@
+{
+  "name": "postgres-schema-compare",
+  "displayName": "PostgresSql Schema compare",
+  "description": "Compare, review, and synchronize PostgreSQL schema objects with local SQL files.",
+  "version": "0.0.2",
+  "publisher": "wcNeo96",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/WeiChun96/postgres-schema-compare"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "logo.ico",
+  "activationEvents": [
+    "onCommand:postgresSchemaCompare.openConnectionSettings",
+    "onCommand:postgresSchemaCompare.compareFileWithDatabase",
+    "onCommand:postgresSchemaCompare.compareFolderWithDatabase",
+    "onCommand:postgresSchemaCompare.compareDatabaseObjectWithFolder",
+    "onCommand:postgresSchemaCompare.swapDiffDirection",
+    "onCommand:postgresSchemaCompare.updateFolderFromDatabase",
+    "onCommand:postgresSchemaCompare.updateDatabaseFromFolder",
+    "onCommand:postgresSchemaCompare.exportDatabaseToFolder",
+    "onCommand:postgresSchemaCompare.revealObjectInExplorer",
+    "onCommand:postgresSchemaCompare.refreshObjectFromDatabase",
+    "onCommand:postgresSchemaCompare.refreshObjectKindFromDatabase",
+    "onView:postgresSchemaCompare.objects"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "postgresSchemaCompare.openConnectionSettings",
+        "title": "Configure Connection",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "postgresSchemaCompare.compareFileWithDatabase",
+        "title": "Compare with Live Database",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "postgresSchemaCompare.compareFolderWithDatabase",
+        "title": "Compare Folder with Database",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(compare-changes)"
+      },
+      {
+        "command": "postgresSchemaCompare.swapDiffDirection",
+        "title": "Swap Compare Direction",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "postgresSchemaCompare.updateFolderFromDatabase",
+        "title": "Update Folder from Live Database",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "postgresSchemaCompare.updateDatabaseFromFolder",
+        "title": "Update Live Database from Folder",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "postgresSchemaCompare.compareDatabaseObjectWithFolder",
+        "title": "Compare with Live Database",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "postgresSchemaCompare.exportDatabaseToFolder",
+        "title": "Write Database to Folder",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(save-all)"
+      },
+      {
+        "command": "postgresSchemaCompare.revealObjectInExplorer",
+        "title": "Reveal in File Explorer",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "postgresSchemaCompare.refreshObjectFromDatabase",
+        "title": "Refresh from Live Database",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "postgresSchemaCompare.refreshObjectKindFromDatabase",
+        "title": "Refresh from Live Database",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "postgresSchemaCompare.deployFileToDatabase",
+        "title": "Deploy to Live Database",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(cloud-upload)"
+      }
+    ],
+    "configuration": {
+      "title": "PostgreSQL Schema Compare",
+      "properties": {
+        "postgresSchemaCompare.host": {
+          "type": "string",
+          "default": "",
+          "description": "PostgreSQL server host."
+        },
+        "postgresSchemaCompare.port": {
+          "type": "number",
+          "default": 5432,
+          "description": "PostgreSQL server port."
+        },
+        "postgresSchemaCompare.database": {
+          "type": "string",
+          "default": "",
+          "description": "PostgreSQL database name."
+        },
+        "postgresSchemaCompare.username": {
+          "type": "string",
+          "default": "",
+          "description": "PostgreSQL username."
+        },
+        "postgresSchemaCompare.password": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "PostgreSQL password. Prefer local workspace settings outside source control."
+        },
+        "postgresSchemaCompare.schemaFolder": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace-relative folder containing Tables, Functions, Sequences, and Views subfolders."
+        }
+      }
+    },
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "postgresSchemaCompare.compareFileWithDatabase",
+          "when": "resourceExtname == .sql",
+          "group": "navigation@50"
+        },
+        {
+          "command": "postgresSchemaCompare.deployFileToDatabase",
+          "when": "resourceExtname == .sql",
+          "group": "navigation@51"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "postgresSchemaCompare.swapDiffDirection",
+          "when": "activeWebviewPanelId != 'postgresSchemaCompare.folderComparison'",
+          "group": "navigation@49"
+        },
+        {
+          "command": "postgresSchemaCompare.updateFolderFromDatabase",
+          "when": "postgresSchemaCompare.hasActiveDiff && activeWebviewPanelId != 'postgresSchemaCompare.folderComparison'",
+          "group": "navigation@51"
+        },
+        {
+          "command": "postgresSchemaCompare.updateDatabaseFromFolder",
+          "when": "postgresSchemaCompare.hasActiveDiff && activeWebviewPanelId != 'postgresSchemaCompare.folderComparison'",
+          "group": "navigation@52"
+        },
+        {
+          "command": "postgresSchemaCompare.compareFileWithDatabase",
+          "when": "resourceExtname == .sql",
+          "group": "navigation@50"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "postgresSchemaCompare.openConnectionSettings",
+          "when": "view == postgresSchemaCompare.objects",
+          "group": "navigation@1"
+        },
+        {
+          "command": "postgresSchemaCompare.compareFolderWithDatabase",
+          "when": "view == postgresSchemaCompare.objects && postgresSchemaCompare.hasConnection",
+          "group": "navigation@2"
+        },
+        {
+          "command": "postgresSchemaCompare.exportDatabaseToFolder",
+          "when": "view == postgresSchemaCompare.objects && postgresSchemaCompare.hasConnection",
+          "group": "navigation@3"
+        },
+        {
+          "command": "postgresSchemaCompare.refreshObjectFromDatabase",
+          "when": "view == postgresSchemaCompare.objects",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "postgresSchemaCompare.exportDatabaseToFolder",
+          "when": "view == postgresSchemaCompare.objects && viewItem == postgresSchemaCompare.connection",
+          "group": "navigation@1"
+        },
+        {
+          "command": "postgresSchemaCompare.refreshObjectKindFromDatabase",
+          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(table|view|function|sequence)Folder$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "postgresSchemaCompare.refreshObjectKindFromDatabase",
+          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(table|view|function|sequence)Folder$/",
+          "group": "navigation@1"
+        },
+        {
+          "command": "postgresSchemaCompare.compareDatabaseObjectWithFolder",
+          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(table|view|function|sequence)$/",
+          "group": "navigation@1"
+        },
+        {
+          "command": "postgresSchemaCompare.revealObjectInExplorer",
+          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(connection|schema|table|view|function|sequence|tableFolder|viewFolder|functionFolder|sequenceFolder)$/",
+          "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "postgresSchemaCompare.compareDatabaseObjectWithFolder",
+          "when": "false"
+        },
+        {
+          "command": "postgresSchemaCompare.revealObjectInExplorer",
+          "when": "false"
+        },
+        {
+          "command": "postgresSchemaCompare.refreshObjectKindFromDatabase",
+          "when": "false"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "postgresSchemaCompare",
+          "title": "PostgreSQL Schema Compare",
+          "icon": "resources/database.svg"
+        }
+      ]
+    },
+    "views": {
+      "postgresSchemaCompare": [
+        {
+          "id": "postgresSchemaCompare.objects",
+          "name": "Database Objects"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "postgresSchemaCompare.objects",
+        "contents": "No database connected.\n[Configure Connection](command:postgresSchemaCompare.openConnectionSettings)",
+        "when": "!postgresSchemaCompare.hasConnection"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "package:vsix": "npx @vscode/vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/pg": "^8.11.6",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.9.1",
+    "typescript": "^5.5.4"
+  }
+}
