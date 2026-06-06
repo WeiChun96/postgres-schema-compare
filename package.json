@@ -1,8 +1,8 @@
 {
   "name": "postgres-schema-compare",
-  "displayName": "PostgresSql Schema compare",
+  "displayName": "PostgreSQL Schema Compare",
   "description": "Compare, review, and synchronize PostgreSQL schema objects with local SQL files.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "wcNeo96",
   "license": "MIT",
   "engines": {
