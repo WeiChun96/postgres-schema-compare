@@ -31,23 +31,7 @@ export function registerCompareFolderWithDatabaseCommand(
     async (resourceUri?: unknown) => {
       try {
         const diffService = serviceFactory.createDiffService(resourceUri);
-        const results = await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: 'Comparing schema folder with PostgreSQL database...',
-            cancellable: false
-          },
-          () => diffService.compareFolderWithDatabase()
-        );
-
-        const changedResults = results.filter((result) => result.status !== 'same');
-
-        if (changedResults.length === 0) {
-          await vscode.window.showInformationMessage('Schema folder matches the live database.');
-          return;
-        }
-
-        const resultById = new Map(changedResults.map((result) => [getResultId(result.ref), result]));
+        const resultById = new Map<string, SchemaComparisonResult>();
         const panel = vscode.window.createWebviewPanel(
           'postgresSchemaCompare.folderComparison',
           'Schema Folder vs Database',
@@ -57,7 +41,7 @@ export function registerCompareFolderWithDatabaseCommand(
           }
         );
 
-        panel.webview.html = renderComparisonHtml(panel.webview, changedResults);
+        panel.webview.html = renderLoadingHtml(panel.webview);
 
         panel.webview.onDidReceiveMessage(
           async (message: ComparisonMessage) => {
@@ -133,6 +117,22 @@ export function registerCompareFolderWithDatabaseCommand(
           undefined,
           context.subscriptions
         );
+
+        try {
+          const results = await diffService.compareFolderWithDatabase();
+          const changedResults = results.filter((result) => result.status !== 'same');
+
+          resultById.clear();
+          for (const result of changedResults) {
+            resultById.set(getResultId(result.ref), result);
+          }
+
+          panel.webview.html = renderComparisonHtml(panel.webview, changedResults);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          panel.webview.html = renderErrorHtml(panel.webview, message);
+          await vscode.window.showErrorMessage(`PostgreSQL Schema Compare: ${message}`);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         await vscode.window.showErrorMessage(`PostgreSQL Schema Compare: ${message}`);
@@ -143,10 +143,128 @@ export function registerCompareFolderWithDatabaseCommand(
   context.subscriptions.push(disposable);
 }
 
+function renderLoadingHtml(webview: vscode.Webview): string {
+  const nonce = createNonce();
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <title>Schema Folder vs Database</title>
+  <style>
+    body {
+      align-items: center;
+      background: var(--vscode-editor-background);
+      color: var(--vscode-foreground);
+      display: flex;
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+      justify-content: center;
+      margin: 0;
+      min-height: 100vh;
+    }
+
+    main {
+      align-items: center;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      text-align: center;
+    }
+
+    .spinner {
+      animation: spin 0.9s linear infinite;
+      border: 3px solid var(--vscode-panel-border);
+      border-radius: 50%;
+      border-top-color: var(--vscode-progressBar-background);
+      height: 34px;
+      width: 34px;
+    }
+
+    .title {
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .detail {
+      color: var(--vscode-descriptionForeground);
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="spinner" aria-hidden="true"></div>
+    <div class="title">Comparing schema folder with PostgreSQL database...</div>
+    <div class="detail">Reading local SQL files and live database definitions.</div>
+  </main>
+  <script nonce="${nonce}"></script>
+</body>
+</html>`;
+}
+
+function renderErrorHtml(webview: vscode.Webview, message: string): string {
+  const nonce = createNonce();
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <title>Schema Folder vs Database</title>
+  <style>
+    body {
+      background: var(--vscode-editor-background);
+      color: var(--vscode-foreground);
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+      margin: 0;
+      padding: 24px;
+    }
+
+    main {
+      max-width: 760px;
+    }
+
+    h1 {
+      color: var(--vscode-errorForeground);
+      font-size: 20px;
+      font-weight: 600;
+      margin: 0 0 12px;
+    }
+
+    pre {
+      background: var(--vscode-textCodeBlock-background);
+      border: 1px solid var(--vscode-panel-border);
+      overflow: auto;
+      padding: 12px;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Compare failed</h1>
+    <pre>${escapeHtml(message)}</pre>
+  </main>
+  <script nonce="${nonce}"></script>
+</body>
+</html>`;
+}
+
 function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaComparisonResult[]): string {
   const nonce = createNonce();
   const counts = getStatusCounts(results);
   const rows = results.map(renderResultRow).join('');
+  const hasResults = results.length > 0;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -311,6 +429,12 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
       flex-wrap: wrap;
       gap: 6px;
     }
+
+    .empty-state {
+      border: 1px solid var(--vscode-panel-border);
+      color: var(--vscode-descriptionForeground);
+      padding: 28px;
+    }
   </style>
 </head>
 <body>
@@ -334,7 +458,7 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
       </div>
     </header>
 
-    <table>
+    ${hasResults ? `<table>
       <thead>
         <tr>
           <th>Status</th>
@@ -347,7 +471,7 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
       <tbody>
         ${rows}
       </tbody>
-    </table>
+    </table>` : '<div class="empty-state">Schema folder matches the live database.</div>'}
   </main>
 
   <script nonce="${nonce}">

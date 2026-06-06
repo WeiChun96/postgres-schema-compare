@@ -7,7 +7,7 @@ It provides a database object explorer, local-vs-live diff views, full folder co
 ## Features
 
 - Configure PostgreSQL connection settings from the extension sidebar.
-- Browse schemas, tables, views, functions, and sequences in the **Database Objects** view.
+- Browse schemas, tables, views, materialized views, indexes, functions, procedures, sequences, triggers, and types in the **Database Objects** view.
 - Compare a local `.sql` file with the live database definition.
 - Compare an object from the sidebar with its matching local schema file.
 - Compare the whole schema folder with the live database in the **Schema Folder vs Database** view.
@@ -50,15 +50,30 @@ schema/
       users.sql
     Views/
       active_users.sql
+    Materialized Views/
+      user_rollups.sql
+    Indexes/
+      users_email_idx.sql
     Functions/
       refresh_user_stats.sql
+    Procedures/
+      archive_users.sql
     Sequences/
       user_id_seq.sql
+    Triggers/
+      users_audit_trigger.sql
+    Types/
+      user_status.sql
   app/
     Tables/
     Views/
+    Materialized Views/
+    Indexes/
     Functions/
+    Procedures/
     Sequences/
+    Triggers/
+    Types/
 ```
 
 Set `postgresSchemaCompare.schemaFolder` to `schema` for the example above.
@@ -70,8 +85,13 @@ schema/
   Tables/
     public.users.sql
   Views/
+  Materialized Views/
+  Indexes/
   Functions/
+  Procedures/
   Sequences/
+  Triggers/
+  Types/
 ```
 
 ## Usage
@@ -104,7 +124,7 @@ After a diff is open, the editor title actions can:
 
 ### Compare One Sidebar Object
 
-In **Database Objects**, select or right-click a table, view, function, or sequence and choose **Compare with Live Database**.
+In **Database Objects**, select or right-click a supported object and choose **Compare with Live Database**.
 
 For tables, the comparison is table-aware. Column order alone is ignored, so a reordered table definition is not treated as modified.
 
@@ -154,7 +174,7 @@ Supported table changes include:
 
 When changing text-like columns to `jsonb`, generated SQL includes a `USING` clause so PostgreSQL can perform the conversion.
 
-For modified views, functions, and sequences, the migration plan replaces the object using drop-and-create style SQL where supported by the extension.
+For modified non-table objects, the migration plan replaces the object using drop-and-create style SQL where supported by the extension.
 
 Review generated migration plans before applying them to important databases.
 

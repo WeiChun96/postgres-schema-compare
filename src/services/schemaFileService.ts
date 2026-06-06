@@ -23,7 +23,7 @@ export class SchemaFileService {
     const parts = relativePath.split(path.sep);
 
     if (parts.length < 2) {
-      throw new Error(`SQL file must be inside ${this.schemaFolderName}/<Schema>/Tables, Functions, Sequences, or Views.`);
+      throw new Error(`SQL file must be inside ${this.schemaFolderName}/<Schema>/<Object Folder>. Supported folders: ${formatSupportedFolders()}.`);
     }
 
     const schemaFolderKind = schemaObjectKindByFolder.get(parts[0].toLowerCase());
@@ -61,7 +61,8 @@ export class SchemaFileService {
     const folderName = schemaObjectFolderByKind[ref.kind];
     const safeObjectName = sanitizeFileSegment(ref.name);
     const safeSchemaName = sanitizeFileSegment(ref.schema);
-    const fileName = `${safeObjectName}.sql`;
+    const safeIdentity = ref.identityArguments ? `__${sanitizeFileSegment(ref.identityArguments)}` : '';
+    const fileName = `${safeObjectName}${safeIdentity}.sql`;
 
     return vscode.Uri.file(path.join(this.schemaRoot.fsPath, safeSchemaName, folderName, fileName));
   }
@@ -195,4 +196,8 @@ function sanitizeFileSegment(value: string): string {
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function formatSupportedFolders(): string {
+  return Object.values(schemaObjectFolderByKind).join(', ');
 }

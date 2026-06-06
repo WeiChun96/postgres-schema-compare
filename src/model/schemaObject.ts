@@ -1,4 +1,16 @@
-export type SchemaObjectKind = 'table' | 'function' | 'sequence' | 'view';
+export const schemaObjectKinds = [
+  'table',
+  'view',
+  'materializedView',
+  'index',
+  'function',
+  'procedure',
+  'sequence',
+  'trigger',
+  'type'
+] as const;
+
+export type SchemaObjectKind = typeof schemaObjectKinds[number];
 
 export interface SchemaObjectRef {
   readonly kind: SchemaObjectKind;
@@ -13,9 +25,14 @@ export interface SchemaObjectDefinition extends SchemaObjectRef {
 
 export const schemaObjectFolderByKind: Record<SchemaObjectKind, string> = {
   table: 'Tables',
+  view: 'Views',
+  materializedView: 'Materialized Views',
+  index: 'Indexes',
   function: 'Functions',
+  procedure: 'Procedures',
   sequence: 'Sequences',
-  view: 'Views'
+  trigger: 'Triggers',
+  type: 'Types'
 };
 
 export const schemaObjectKindByFolder = new Map<string, SchemaObjectKind>(

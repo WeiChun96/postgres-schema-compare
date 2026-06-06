@@ -8,7 +8,7 @@ import { registerRevealObjectInExplorerCommand } from './commands/revealObjectIn
 import { registerSwapDiffDirectionCommand } from './commands/swapDiffDirection';
 import { registerSyncActiveDiffCommands } from './commands/syncActiveDiff';
 import { hasConnectionConfig } from './config';
-import { schemaObjectFolderByKind, SchemaObjectKind } from './model/schemaObject';
+import { schemaObjectFolderByKind, schemaObjectKinds, SchemaObjectKind } from './model/schemaObject';
 import { DiffSessionState } from './services/diffSessionState';
 import { LiveSchemaDocumentProvider } from './services/schemaDiffService';
 import { ServiceFactory } from './services/serviceFactory';
@@ -82,7 +82,7 @@ function registerRefreshObjectKindFromDatabaseCommand(
           const kind = resolveSchemaObjectKind(input);
 
           if (!kind) {
-            throw new Error('Select Tables, Views, Functions, or Sequences to refresh.');
+            throw new Error('Select a supported PostgreSQL object folder to refresh.');
           }
 
           await vscode.window.withProgress(
@@ -103,11 +103,15 @@ function registerRefreshObjectKindFromDatabaseCommand(
 }
 
 function resolveSchemaObjectKind(input: SchemaObjectKind | { readonly kind?: SchemaObjectKind } | undefined): SchemaObjectKind | undefined {
-  if (input === 'table' || input === 'view' || input === 'function' || input === 'sequence') {
+  if (typeof input === 'string' && schemaObjectKinds.includes(input)) {
     return input;
   }
 
-  return input?.kind;
+  if (input && typeof input === 'object' && input.kind && schemaObjectKinds.includes(input.kind)) {
+    return input.kind;
+  }
+
+  return undefined;
 }
 
 function updateConnectionContext(): void {

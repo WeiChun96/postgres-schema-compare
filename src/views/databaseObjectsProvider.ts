@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { ExtensionConfig, getExtensionConfig, hasConnectionConfig } from '../config';
-import { schemaObjectFolderByKind, SchemaObjectKind, SchemaObjectRef } from '../model/schemaObject';
+import { schemaObjectFolderByKind, schemaObjectKinds, SchemaObjectKind, SchemaObjectRef } from '../model/schemaObject';
 import { PostgresSchemaService } from '../services/postgresSchemaService';
 import { areDefinitionsEquivalent } from '../services/schemaDiffService';
 import { SchemaFileService } from '../services/schemaFileService';
@@ -203,7 +203,7 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
     }
 
     if (node.type === 'schema') {
-      return (['table', 'view', 'function', 'sequence'] as const).map((kind) => ({
+      return schemaObjectKinds.map((kind) => ({
         type: 'folder',
         schema: node.schema,
         kind,
@@ -259,6 +259,7 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
 
     const schemaFileService = new SchemaFileService(workspaceFolder, config.schemaFolder, 'public');
     const objectsByKey = new Map(databaseObjects.map((object) => [getObjectKey(object), object]));
+    const ignoredLocalOnlyObjectKeys = new Set((await postgresSchemaService.listConstraintBackedIndexes()).map(getLocalFileObjectKey));
 
     for (const object of databaseObjects) {
       try {
@@ -288,6 +289,10 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
       }
 
       const key = getObjectKey(localObject);
+
+      if (ignoredLocalOnlyObjectKeys.has(getLocalFileObjectKey(localObject))) {
+        continue;
+      }
 
       if (!objectsByKey.has(key)) {
         objectsByKey.set(key, localObject);
@@ -339,8 +344,8 @@ function createFolderItem(kind: SchemaObjectKind, counts: FolderComparisonCounts
 function createObjectItem(node: Extract<DatabaseTreeNode, { type: 'object' }>): vscode.TreeItem {
   const object = node.object;
   const item = new vscode.TreeItem(object.name, vscode.TreeItemCollapsibleState.None);
-  item.description = getObjectDescription(object.kind, node.comparisonStatus);
-  item.tooltip = `${object.schema}.${object.name}${node.comparisonStatus ? ` - ${getComparisonLabel(node.comparisonStatus)}` : ''}`;
+  item.description = getObjectDescription(object, node.comparisonStatus);
+  item.tooltip = `${object.schema}.${object.name}${object.identityArguments ? ` (${object.identityArguments})` : ''}${node.comparisonStatus ? ` - ${getComparisonLabel(node.comparisonStatus)}` : ''}`;
   item.iconPath = new vscode.ThemeIcon(getObjectIcon(object.kind), getComparisonThemeColor(node.comparisonStatus));
   item.contextValue = `postgresSchemaCompare.${object.kind}`;
   item.command = {
@@ -374,10 +379,20 @@ function getFolderIcon(kind: SchemaObjectKind): string {
       return 'table';
     case 'view':
       return 'preview';
+    case 'materializedView':
+      return 'preview';
+    case 'index':
+      return 'symbol-key';
     case 'function':
+      return 'symbol-method';
+    case 'procedure':
       return 'symbol-method';
     case 'sequence':
       return 'list-ordered';
+    case 'trigger':
+      return 'zap';
+    case 'type':
+      return 'symbol-class';
   }
 }
 
@@ -387,14 +402,28 @@ function getObjectIcon(kind: SchemaObjectKind): string {
       return 'table';
     case 'view':
       return 'eye';
+    case 'materializedView':
+      return 'preview';
+    case 'index':
+      return 'symbol-key';
     case 'function':
+      return 'symbol-method';
+    case 'procedure':
       return 'symbol-method';
     case 'sequence':
       return 'symbol-number';
+    case 'trigger':
+      return 'zap';
+    case 'type':
+      return 'symbol-class';
   }
 }
 
 function getObjectKey(ref: SchemaObjectRef): string {
+  return `${ref.kind}:${ref.schema}.${ref.name}:${ref.identityArguments ?? ''}`;
+}
+
+function getLocalFileObjectKey(ref: SchemaObjectRef): string {
   return `${ref.kind}:${ref.schema}.${ref.name}`;
 }
 
@@ -422,12 +451,12 @@ function isAbsolutePath(value: string): boolean {
   return /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\') || value.startsWith('/');
 }
 
-function getObjectDescription(kind: SchemaObjectKind, status: ObjectComparisonStatus | undefined): string {
+function getObjectDescription(ref: SchemaObjectRef, status: ObjectComparisonStatus | undefined): string {
   if (!status || status === 'same') {
-    return kind;
+    return ref.kind;
   }
 
-  return `${kind} - ${getComparisonLabel(status)}`;
+  return `${ref.kind} - ${getComparisonLabel(status)}`;
 }
 
 function getComparisonLabel(status: ObjectComparisonStatus): string {

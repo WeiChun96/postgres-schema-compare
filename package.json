@@ -2,7 +2,7 @@
   "name": "postgres-schema-compare",
   "displayName": "PostgreSQL Schema Compare",
   "description": "Compare, review, and synchronize PostgreSQL schema objects with local SQL files.",
-  "version": "0.0.4",
+  "version": "0.1.0",
   "publisher": "wcNeo96",
   "license": "MIT",
   "engines": {
@@ -137,7 +137,7 @@
         "postgresSchemaCompare.schemaFolder": {
           "type": "string",
           "default": "",
-          "description": "Workspace-relative folder containing Tables, Functions, Sequences, and Views subfolders."
+          "description": "Workspace-relative folder containing PostgreSQL schema object subfolders."
         }
       }
     },
@@ -206,22 +206,22 @@
         },
         {
           "command": "postgresSchemaCompare.refreshObjectKindFromDatabase",
-          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(table|view|function|sequence)Folder$/",
+          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(table|view|materializedView|index|function|procedure|sequence|trigger|type)Folder$/",
           "group": "inline@1"
         },
         {
           "command": "postgresSchemaCompare.refreshObjectKindFromDatabase",
-          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(table|view|function|sequence)Folder$/",
+          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(table|view|materializedView|index|function|procedure|sequence|trigger|type)Folder$/",
           "group": "navigation@1"
         },
         {
           "command": "postgresSchemaCompare.compareDatabaseObjectWithFolder",
-          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(table|view|function|sequence)$/",
+          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(table|view|materializedView|index|function|procedure|sequence|trigger|type)$/",
           "group": "navigation@1"
         },
         {
           "command": "postgresSchemaCompare.revealObjectInExplorer",
-          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(connection|schema|table|view|function|sequence|tableFolder|viewFolder|functionFolder|sequenceFolder)$/",
+          "when": "view == postgresSchemaCompare.objects && viewItem =~ /postgresSchemaCompare\\.(connection|schema|table|view|materializedView|index|function|procedure|sequence|trigger|type|tableFolder|viewFolder|materializedViewFolder|indexFolder|functionFolder|procedureFolder|sequenceFolder|triggerFolder|typeFolder)$/",
           "group": "navigation@2"
         }
       ],
