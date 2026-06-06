@@ -38,13 +38,6 @@ export function registerCompareDatabaseObjectWithFolderCommand(
           throw new Error(comparison.message ?? 'Could not compare this object.');
         }
 
-        if (comparison.status === 'same') {
-          diffSessionState.clearLastDiff();
-          await vscode.commands.executeCommand('setContext', 'postgresSchemaCompare.hasActiveDiff', false);
-          await vscode.window.showInformationMessage(`No schema differences found for ${ref.schema}.${ref.name}.`);
-          return;
-        }
-
         const preparedDiff = await diffService.prepareComparisonDiff(comparison);
 
         diffSessionState.setLastDiff({

@@ -95,12 +95,14 @@ export class PostgresSchemaService {
           union all
           select
             'sequence' as kind,
-            sequence_schema as schema,
-            sequence_name as name,
+            n.nspname as schema,
+            c.relname as name,
             null::text as "identityArguments"
-          from information_schema.sequences
-          where sequence_schema not in ('pg_catalog', 'information_schema')
-            and sequence_schema not like 'pg_toast%'
+          from pg_class c
+          join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname not in ('pg_catalog', 'information_schema')
+            and n.nspname not like 'pg_toast%'
+            and c.relkind = 'S'
           union all
           select
             'function' as kind,
@@ -219,18 +221,23 @@ export class PostgresSchemaService {
     }>(
       `
         select format(
-          'CREATE SEQUENCE %I.%I INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s%s',
-          sequence_schema,
-          sequence_name,
-          increment,
-          minimum_value,
-          maximum_value,
-          start_value,
-          case when cycle_option = 'YES' then ' CYCLE' else '' end
+          'CREATE SEQUENCE %I.%I AS %s INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s CACHE %s%s',
+          n.nspname,
+          c.relname,
+          pg_catalog.format_type(s.seqtypid, null),
+          s.seqincrement,
+          s.seqmin,
+          s.seqmax,
+          s.seqstart,
+          s.seqcache,
+          case when s.seqcycle then ' CYCLE' else '' end
         ) as ddl
-        from information_schema.sequences
-        where sequence_schema = $1
-          and sequence_name = $2
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        join pg_sequence s on s.seqrelid = c.oid
+        where n.nspname = $1
+          and c.relname = $2
+          and c.relkind = 'S'
       `,
       [ref.schema, ref.name]
     );
