@@ -280,8 +280,17 @@ export class SchemaDiffService {
   }
 
   private async getDatabaseMigrationPlanSql(result: SchemaComparisonResult): Promise<string> {
+    return formatMigrationPlanPhases(await this.getDatabaseMigrationPlanPhases(result), true);
+  }
+
+  private async getDatabaseMigrationPlanPhases(
+    result: SchemaComparisonResult,
+    localTables?: ReadonlyMap<string, ParsedTableDefinition>
+  ): Promise<MigrationPlanPhases> {
     if (result.status === 'missingLocal') {
-      return this.postgresSchemaService.getDropObjectSql(result.ref);
+      return createMigrationPlanPhases({
+        other: [this.postgresSchemaService.getDropObjectSql(result.ref).trim()]
+      });
     }
 
     const localUri = result.localUri ?? this.schemaFileService.getLocalObjectUri(result.ref);
@@ -293,14 +302,18 @@ export class SchemaDiffService {
 
     if (result.status === 'modified' && result.ref.kind === 'table') {
       const liveDefinition = await this.postgresSchemaService.getObjectDefinition(result.ref);
-      return createTableMigrationPlan(result.ref, liveDefinition.ddl, sql);
+      return createTableMigrationPlanPhases(result.ref, liveDefinition.ddl, sql, localTables);
     }
 
     if (result.status === 'modified') {
-      return this.postgresSchemaService.getSqlReplacingObject(result.ref, sql);
+      return createMigrationPlanPhases({
+        other: [stripTransactionWrapper(this.postgresSchemaService.getSqlReplacingObject(result.ref, sql)).trim()]
+      });
     }
 
-    return ensureTrailingNewline(sql);
+    return createMigrationPlanPhases({
+      other: [sql.trim()]
+    });
   }
 
   private async getDatabaseMigrationPlanSqlForResults(results: readonly SchemaComparisonResult[]): Promise<string> {
@@ -310,17 +323,18 @@ export class SchemaDiffService {
       throw new Error('No database differences are available for migration.');
     }
 
-    const plans: string[] = [];
+    const combined = createMigrationPlanPhases();
+    const localTables = await this.getLocalTableDefinitions();
 
-    for (const result of actionableResults) {
-      const sql = (await this.getDatabaseMigrationPlanSql(result)).trim();
-
-      if (sql) {
-        plans.push(`-- ${result.ref.schema}.${result.ref.name} (${result.ref.kind}, ${result.status})\n${sql}`);
-      }
+    for (const result of sortMigrationResultsByTableDependencies(actionableResults, localTables)) {
+      appendMigrationPlanPhases(
+        combined,
+        await this.getDatabaseMigrationPlanPhases(result, localTables),
+        `-- ${result.ref.schema}.${result.ref.name} (${result.ref.kind}, ${result.status})`
+      );
     }
 
-    return ensureTrailingNewline(plans.join('\n\n'));
+    return formatMigrationPlanPhases(combined, true);
   }
 
   private async getLiveUriOrEmpty(ref: SchemaObjectRef): Promise<vscode.Uri> {
@@ -336,6 +350,101 @@ export class SchemaDiffService {
       throw error;
     }
   }
+
+  private async getLocalTableDefinitions(): Promise<ReadonlyMap<string, ParsedTableDefinition>> {
+    const tables = new Map<string, ParsedTableDefinition>();
+    const localObjects = await this.schemaFileService.listLocalObjects();
+
+    for (const localObject of localObjects) {
+      if (localObject.kind !== 'table') {
+        continue;
+      }
+
+      const localSql = await this.schemaFileService.tryReadLocalFile(this.schemaFileService.getLocalObjectUri(localObject));
+      if (!localSql) {
+        continue;
+      }
+
+      try {
+        tables.set(getTableDefinitionKey(localObject.schema, localObject.name), parseCreateTableDefinition(localSql));
+      } catch {
+        // Ignore unparseable local tables here. The normal comparison path reports those failures.
+      }
+    }
+
+    return tables;
+  }
+}
+
+function sortMigrationResultsByTableDependencies(
+  results: readonly SchemaComparisonResult[],
+  localTables: ReadonlyMap<string, ParsedTableDefinition>
+): SchemaComparisonResult[] {
+  const tableResultsByKey = new Map<string, SchemaComparisonResult>();
+  const tableResultKeys = new Set<string>();
+  const ordered: SchemaComparisonResult[] = [];
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+
+  for (const result of results) {
+    if (result.ref.kind !== 'table') {
+      continue;
+    }
+
+    const key = getTableDefinitionKey(result.ref.schema, result.ref.name);
+    tableResultsByKey.set(key, result);
+    tableResultKeys.add(key);
+  }
+
+  const visit = (key: string): void => {
+    if (visited.has(key)) {
+      return;
+    }
+
+    if (visiting.has(key)) {
+      return;
+    }
+
+    visiting.add(key);
+
+    const result = tableResultsByKey.get(key);
+    const table = localTables.get(key);
+
+    if (result && table) {
+      for (const constraint of table.constraints.values()) {
+        const reference = constraint.foreignKeyReference;
+        if (!reference) {
+          continue;
+        }
+
+        const referencedKey = getTableDefinitionKey(reference.schema ?? result.ref.schema, reference.table);
+        if (tableResultKeys.has(referencedKey)) {
+          visit(referencedKey);
+        }
+      }
+    }
+
+    visiting.delete(key);
+    visited.add(key);
+
+    if (result) {
+      ordered.push(result);
+    }
+  };
+
+  for (const result of results) {
+    if (result.ref.kind === 'table') {
+      visit(getTableDefinitionKey(result.ref.schema, result.ref.name));
+    }
+  }
+
+  for (const result of results) {
+    if (result.ref.kind !== 'table') {
+      ordered.push(result);
+    }
+  }
+
+  return ordered;
 }
 
 function createPreparedDiff(
@@ -446,7 +555,26 @@ interface ParsedColumn {
 interface ParsedConstraint {
   readonly name: string;
   readonly definition: string;
+  readonly kind: ParsedConstraintKind;
+  readonly foreignKeyReference?: ForeignKeyReference;
   readonly raw: string;
+}
+
+type ParsedConstraintKind = 'foreignKey' | 'primaryUniqueCheck' | 'other';
+
+interface ForeignKeyReference {
+  readonly schema?: string;
+  readonly table: string;
+  readonly columns: readonly string[];
+}
+
+interface MigrationPlanPhases {
+  readonly dropForeignKeys: string[];
+  readonly dropPrimaryUniqueCheckConstraints: string[];
+  readonly alterColumns: string[];
+  readonly addPrimaryUniqueCheckConstraints: string[];
+  readonly addForeignKeys: string[];
+  readonly other: string[];
 }
 
 function areTableDefinitionsEquivalent(liveSql: string, localSql: string): boolean {
@@ -582,25 +710,32 @@ function summarizeChanges(changes: readonly string[], fallback: string): string 
   return `${visibleChanges.join('; ')}${suffix}`;
 }
 
-function createTableMigrationPlan(ref: SchemaObjectRef, liveSql: string, localSql: string): string {
+function createTableMigrationPlanPhases(
+  ref: SchemaObjectRef,
+  liveSql: string,
+  localSql: string,
+  localTables?: ReadonlyMap<string, ParsedTableDefinition>
+): MigrationPlanPhases {
   const liveTable = parseCreateTableDefinition(liveSql);
   const localTable = parseCreateTableDefinition(localSql);
-  const dropStatements: string[] = [];
-  const alterStatements: string[] = [];
-  const addStatements: string[] = [];
+  const phases = createMigrationPlanPhases();
   const tableName = getQualifiedName(ref);
+
+  if (hasPrimaryKeyOrForeignKeyChanges(liveTable, localTable)) {
+    return createTableRebuildMigrationPlanPhases(ref, liveTable, localTable, localTables);
+  }
 
   for (const [name, liveConstraint] of liveTable.constraints) {
     const localConstraint = localTable.constraints.get(name);
 
     if (!localConstraint || normalizeSqlFragment(localConstraint.raw) !== normalizeSqlFragment(liveConstraint.raw)) {
-      dropStatements.push(`ALTER TABLE ${tableName} DROP CONSTRAINT IF EXISTS ${quoteIdentifier(name)};`);
+      getDropConstraintPhase(phases, liveConstraint).push(`ALTER TABLE ${tableName} DROP CONSTRAINT IF EXISTS ${quoteIdentifier(name)};`);
     }
   }
 
   for (const [name] of liveTable.columns) {
     if (!localTable.columns.has(name)) {
-      dropStatements.push(`ALTER TABLE ${tableName} DROP COLUMN ${quoteIdentifier(name)};`);
+      phases.alterColumns.push(`ALTER TABLE ${tableName} DROP COLUMN ${quoteIdentifier(name)};`);
     }
   }
 
@@ -608,28 +743,101 @@ function createTableMigrationPlan(ref: SchemaObjectRef, liveSql: string, localSq
     const liveColumn = liveTable.columns.get(name);
 
     if (!liveColumn) {
-      addStatements.push(`ALTER TABLE ${tableName} ADD COLUMN ${quoteIdentifier(name)} ${localColumn.definition};`);
+      phases.alterColumns.push(`ALTER TABLE ${tableName} ADD COLUMN ${quoteIdentifier(name)} ${localColumn.definition};`);
       continue;
     }
 
-    alterStatements.push(...createColumnAlterStatements(tableName, liveColumn, localColumn));
+    phases.alterColumns.push(...createColumnAlterStatements(tableName, liveColumn, localColumn));
   }
 
   for (const [name, localConstraint] of localTable.constraints) {
     const liveConstraint = liveTable.constraints.get(name);
 
     if (!liveConstraint || normalizeSqlFragment(localConstraint.raw) !== normalizeSqlFragment(liveConstraint.raw)) {
-      addStatements.push(`ALTER TABLE ${tableName} ADD CONSTRAINT ${quoteIdentifier(name)} ${localConstraint.definition};`);
+      getAddConstraintPhase(phases, localConstraint).push(...createAddConstraintStatements(ref, tableName, name, localConstraint, localTables));
     }
   }
 
-  const statements = [...dropStatements, ...alterStatements, ...addStatements];
-
-  if (statements.length === 0) {
-    return `-- No compatible ALTER TABLE changes were detected for ${ref.schema}.${ref.name}.\n`;
+  if (getMigrationPlanStatements(phases).length === 0) {
+    phases.other.push(`-- No compatible ALTER TABLE changes were detected for ${ref.schema}.${ref.name}.`);
   }
 
-  return ensureTrailingNewline(['BEGIN;', ...statements, 'COMMIT;'].join('\n\n'));
+  return phases;
+}
+
+function createTableRebuildMigrationPlanPhases(
+  ref: SchemaObjectRef,
+  liveTable: ParsedTableDefinition,
+  localTable: ParsedTableDefinition,
+  localTables?: ReadonlyMap<string, ParsedTableDefinition>
+): MigrationPlanPhases {
+  const phases = createMigrationPlanPhases();
+  const tableName = getQualifiedName(ref);
+
+  for (const [name, liveConstraint] of liveTable.constraints) {
+    if (liveConstraint.kind === 'foreignKey') {
+      phases.dropForeignKeys.push(`ALTER TABLE ${tableName} DROP CONSTRAINT IF EXISTS ${quoteIdentifier(name)};`);
+    }
+  }
+
+  phases.alterColumns.push(`-- WARNING: Rebuilding ${ref.schema}.${ref.name} because primary key or foreign key definitions changed.`);
+  phases.alterColumns.push(`-- This drops table data. Review and backup before running against important databases.`);
+  phases.alterColumns.push(`DROP TABLE IF EXISTS ${tableName} CASCADE;`);
+  phases.alterColumns.push(createCreateTableWithoutForeignKeysSql(ref, localTable));
+
+  for (const [name, localConstraint] of localTable.constraints) {
+    if (localConstraint.kind === 'foreignKey') {
+      phases.addForeignKeys.push(...createAddConstraintStatements(ref, tableName, name, localConstraint, localTables));
+    }
+  }
+
+  return phases;
+}
+
+function hasPrimaryKeyOrForeignKeyChanges(liveTable: ParsedTableDefinition, localTable: ParsedTableDefinition): boolean {
+  const relevantConstraintNames = new Set<string>();
+
+  for (const [name, constraint] of liveTable.constraints) {
+    if (isPrimaryKeyOrForeignKeyConstraint(constraint)) {
+      relevantConstraintNames.add(name);
+    }
+  }
+
+  for (const [name, constraint] of localTable.constraints) {
+    if (isPrimaryKeyOrForeignKeyConstraint(constraint)) {
+      relevantConstraintNames.add(name);
+    }
+  }
+
+  for (const name of relevantConstraintNames) {
+    const liveConstraint = liveTable.constraints.get(name);
+    const localConstraint = localTable.constraints.get(name);
+
+    if (!liveConstraint || !localConstraint) {
+      return true;
+    }
+
+    if (normalizeSqlFragment(liveConstraint.raw) !== normalizeSqlFragment(localConstraint.raw)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isPrimaryKeyOrForeignKeyConstraint(constraint: ParsedConstraint): boolean {
+  return constraint.kind === 'foreignKey' || normalizeSqlFragment(constraint.definition).startsWith('primary key');
+}
+
+function createCreateTableWithoutForeignKeysSql(ref: SchemaObjectRef, table: ParsedTableDefinition): string {
+  const definitions = [
+    ...Array.from(table.columns.values()).map((column) => `  ${column.raw}`),
+    ...Array.from(table.constraints.values())
+      .filter((constraint) => constraint.kind !== 'foreignKey')
+      .map((constraint) => `  ${constraint.raw}`)
+  ];
+
+  return `CREATE TABLE ${getQualifiedName(ref)} (\n${definitions.join(',\n')}\n);`;
 }
 
 function createColumnAlterStatements(tableName: string, liveColumn: ParsedColumn, localColumn: ParsedColumn): string[] {
@@ -663,6 +871,164 @@ function createColumnAlterStatements(tableName: string, liveColumn: ParsedColumn
   }
 
   return statements;
+}
+
+function createMigrationPlanPhases(values?: Partial<MigrationPlanPhases>): MigrationPlanPhases {
+  return {
+    dropForeignKeys: values?.dropForeignKeys ?? [],
+    dropPrimaryUniqueCheckConstraints: values?.dropPrimaryUniqueCheckConstraints ?? [],
+    alterColumns: values?.alterColumns ?? [],
+    addPrimaryUniqueCheckConstraints: values?.addPrimaryUniqueCheckConstraints ?? [],
+    addForeignKeys: values?.addForeignKeys ?? [],
+    other: values?.other ?? []
+  };
+}
+
+function appendMigrationPlanPhases(target: MigrationPlanPhases, source: MigrationPlanPhases, comment: string): void {
+  appendPhase(target.dropForeignKeys, source.dropForeignKeys, comment);
+  appendPhase(target.dropPrimaryUniqueCheckConstraints, source.dropPrimaryUniqueCheckConstraints, comment);
+  appendPhase(target.alterColumns, source.alterColumns, comment);
+  appendPhase(target.addPrimaryUniqueCheckConstraints, source.addPrimaryUniqueCheckConstraints, comment);
+  appendPhase(target.addForeignKeys, source.addForeignKeys, comment);
+  appendPhase(target.other, source.other, comment);
+}
+
+function appendPhase(target: string[], statements: readonly string[], comment: string): void {
+  if (statements.length === 0) {
+    return;
+  }
+
+  target.push(comment, ...statements);
+}
+
+function formatMigrationPlanPhases(phases: MigrationPlanPhases, wrapTransaction: boolean): string {
+  const statements = getMigrationPlanStatements(phases);
+
+  if (statements.length === 0) {
+    return '';
+  }
+
+  return ensureTrailingNewline([
+    ...(wrapTransaction ? ['BEGIN;'] : []),
+    ...statements,
+    ...(wrapTransaction ? ['COMMIT;'] : [])
+  ].join('\n\n'));
+}
+
+function getMigrationPlanStatements(phases: MigrationPlanPhases): string[] {
+  return [
+    ...withPhaseHeader('1. Drop foreign keys', phases.dropForeignKeys),
+    ...withPhaseHeader('2. Drop primary/unique/check constraints', phases.dropPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('3. Drop/alter/add columns', phases.alterColumns),
+    ...withPhaseHeader('4. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('5. Add foreign keys', phases.addForeignKeys),
+    ...withPhaseHeader('Other object changes', phases.other)
+  ];
+}
+
+function withPhaseHeader(header: string, statements: readonly string[]): string[] {
+  return statements.length === 0 ? [] : [`-- ${header}`, ...statements];
+}
+
+function getDropConstraintPhase(phases: MigrationPlanPhases, constraint: ParsedConstraint): string[] {
+  if (constraint.kind === 'foreignKey') {
+    return phases.dropForeignKeys;
+  }
+
+  if (constraint.kind === 'primaryUniqueCheck') {
+    return phases.dropPrimaryUniqueCheckConstraints;
+  }
+
+  return phases.other;
+}
+
+function getAddConstraintPhase(phases: MigrationPlanPhases, constraint: ParsedConstraint): string[] {
+  if (constraint.kind === 'foreignKey') {
+    return phases.addForeignKeys;
+  }
+
+  if (constraint.kind === 'primaryUniqueCheck') {
+    return phases.addPrimaryUniqueCheckConstraints;
+  }
+
+  return phases.other;
+}
+
+function createAddConstraintStatements(
+  ref: SchemaObjectRef,
+  tableName: string,
+  constraintName: string,
+  constraint: ParsedConstraint,
+  localTables?: ReadonlyMap<string, ParsedTableDefinition>
+): string[] {
+  if (constraint.kind !== 'foreignKey') {
+    return [`ALTER TABLE ${tableName} ADD CONSTRAINT ${quoteIdentifier(constraintName)} ${constraint.definition};`];
+  }
+
+  const blocker = getForeignKeyBlocker(ref, constraint, localTables);
+  if (blocker) {
+    return [
+      `-- Skipped FK ${tableName}.${quoteIdentifier(constraintName)}: ${blocker}`,
+      `-- Review after parent table migration: ALTER TABLE ${tableName} ADD CONSTRAINT ${quoteIdentifier(constraintName)} ${constraint.definition};`
+    ];
+  }
+
+  return [
+    `ALTER TABLE ${tableName} ADD CONSTRAINT ${quoteIdentifier(constraintName)} ${constraint.definition};`
+  ];
+}
+
+function getForeignKeyBlocker(
+  ref: SchemaObjectRef,
+  constraint: ParsedConstraint,
+  localTables: ReadonlyMap<string, ParsedTableDefinition> | undefined
+): string | undefined {
+  const reference = constraint.foreignKeyReference;
+  if (!reference || !localTables) {
+    return undefined;
+  }
+
+  const referencedSchema = reference.schema ?? ref.schema;
+  const referencedTable = localTables.get(getTableDefinitionKey(referencedSchema, reference.table));
+
+  if (!referencedTable) {
+    return undefined;
+  }
+
+  const missingColumns = reference.columns.filter((column) => !referencedTable.columns.has(column));
+  if (missingColumns.length > 0) {
+    return `referenced column(s) ${missingColumns.map(quoteIdentifier).join(', ')} do not exist in local table ${referencedSchema}.${reference.table}`;
+  }
+
+  return undefined;
+}
+
+function getConstraintKind(definition: string): ParsedConstraintKind {
+  const normalized = normalizeSqlFragment(definition);
+
+  if (normalized.startsWith('foreign key')) {
+    return 'foreignKey';
+  }
+
+  if (
+    normalized.startsWith('primary key') ||
+    normalized.startsWith('unique') ||
+    normalized.startsWith('check')
+  ) {
+    return 'primaryUniqueCheck';
+  }
+
+  return 'other';
+}
+
+function stripTransactionWrapper(sql: string): string {
+  const lines = sql
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => !/^BEGIN;?$/i.test(line) && !/^COMMIT;?$/i.test(line));
+
+  return lines.join('\n');
 }
 
 function parseCreateTableDefinition(sql: string): ParsedTableDefinition {
@@ -741,11 +1107,61 @@ function parseColumnDefinition(raw: string): ParsedColumn {
 function parseConstraintDefinition(raw: string): ParsedConstraint {
   const withoutKeyword = raw.replace(/^CONSTRAINT\b/i, '').trimStart();
   const identifier = readIdentifier(withoutKeyword);
+  const definition = withoutKeyword.slice(identifier.endIndex).trim();
 
   return {
     name: identifier.value,
-    definition: withoutKeyword.slice(identifier.endIndex).trim(),
+    definition,
+    kind: getConstraintKind(definition),
+    foreignKeyReference: parseForeignKeyReference(definition),
     raw
+  };
+}
+
+function parseForeignKeyReference(definition: string): ForeignKeyReference | undefined {
+  const referencesIndex = findTopLevelKeyword(definition, 'REFERENCES');
+  if (referencesIndex === undefined) {
+    return undefined;
+  }
+
+  const afterReferences = definition.slice(referencesIndex + 'REFERENCES'.length).trimStart();
+  const relation = readQualifiedRelationName(afterReferences);
+  let rest = afterReferences.slice(relation.endIndex).trimStart();
+
+  if (!rest.startsWith('(')) {
+    return { schema: relation.schema, table: relation.table, columns: [] };
+  }
+
+  const closeIndex = findMatchingCloseParenthesis(rest, 0);
+  const columns = splitTopLevelComma(rest.slice(1, closeIndex))
+    .map((column) => readIdentifier(column).value);
+
+  return { schema: relation.schema, table: relation.table, columns };
+}
+
+function readQualifiedRelationName(value: string): { readonly schema?: string; readonly table: string; readonly endIndex: number } {
+  const firstIdentifier = readIdentifier(value);
+  let rest = value.slice(firstIdentifier.endIndex);
+  let consumedLength = firstIdentifier.endIndex;
+
+  if (!rest.trimStart().startsWith('.')) {
+    return {
+      table: firstIdentifier.value,
+      endIndex: firstIdentifier.endIndex
+    };
+  }
+
+  const leadingWhitespaceLength = rest.length - rest.trimStart().length;
+  rest = rest.trimStart().slice(1);
+  const secondLeadingWhitespaceLength = rest.length - rest.trimStart().length;
+  rest = rest.trimStart();
+  const secondIdentifier = readIdentifier(rest);
+  consumedLength += leadingWhitespaceLength + 1 + secondLeadingWhitespaceLength + secondIdentifier.endIndex;
+
+  return {
+    schema: firstIdentifier.value,
+    table: secondIdentifier.value,
+    endIndex: consumedLength
   };
 }
 
@@ -980,6 +1396,10 @@ function isTextType(value: string): boolean {
 
 function getQualifiedName(ref: SchemaObjectRef): string {
   return `${quoteIdentifier(ref.schema)}.${quoteIdentifier(ref.name)}`;
+}
+
+function getTableDefinitionKey(schema: string, table: string): string {
+  return `${schema}.${table}`.toLowerCase();
 }
 
 function quoteIdentifier(value: string): string {
