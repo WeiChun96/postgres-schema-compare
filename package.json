@@ -157,17 +157,17 @@
       "editor/title": [
         {
           "command": "postgresSchemaCompare.swapDiffDirection",
-          "when": "activeWebviewPanelId != 'postgresSchemaCompare.folderComparison'",
+          "when": "activeWebviewPanelId != 'postgresSchemaCompare.folderComparison' && activeWebviewPanelId != 'postgresSchemaCompare.connectionSettings'",
           "group": "navigation@49"
         },
         {
           "command": "postgresSchemaCompare.updateFolderFromDatabase",
-          "when": "postgresSchemaCompare.hasActiveDiff && activeWebviewPanelId != 'postgresSchemaCompare.folderComparison'",
+          "when": "postgresSchemaCompare.hasActiveDiff && activeWebviewPanelId != 'postgresSchemaCompare.folderComparison' && activeWebviewPanelId != 'postgresSchemaCompare.connectionSettings'",
           "group": "navigation@51"
         },
         {
           "command": "postgresSchemaCompare.updateDatabaseFromFolder",
-          "when": "postgresSchemaCompare.hasActiveDiff && activeWebviewPanelId != 'postgresSchemaCompare.folderComparison'",
+          "when": "postgresSchemaCompare.hasActiveDiff && activeWebviewPanelId != 'postgresSchemaCompare.folderComparison' && activeWebviewPanelId != 'postgresSchemaCompare.connectionSettings'",
           "group": "navigation@52"
         },
         {

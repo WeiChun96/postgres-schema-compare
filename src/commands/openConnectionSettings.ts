@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { getExtensionConfig, updateExtensionConfig } from '../config';
+import { ExtensionConfig, getExtensionConfig, updateExtensionConfig } from '../config';
 import { PostgresSchemaService } from '../services/postgresSchemaService';
 
 type ConnectionSettingsMessage =
@@ -7,18 +7,15 @@ type ConnectionSettingsMessage =
   | TestConnectionSettingsMessage
   | ChooseSchemaFolderMessage;
 
-interface SaveConnectionSettingsMessage {
+interface SaveConnectionSettingsMessage extends ConnectionSettingsFormMessage {
   readonly type: 'save';
-  readonly host: string;
-  readonly port: string;
-  readonly database: string;
-  readonly username: string;
-  readonly password: string;
-  readonly schemaFolder: string;
 }
 
-interface TestConnectionSettingsMessage {
+interface TestConnectionSettingsMessage extends ConnectionSettingsFormMessage {
   readonly type: 'testConnection';
+}
+
+interface ConnectionSettingsFormMessage {
   readonly host: string;
   readonly port: string;
   readonly database: string;
@@ -31,8 +28,14 @@ interface ChooseSchemaFolderMessage {
   readonly type: 'chooseSchemaFolder';
 }
 
+interface ValidationResult {
+  readonly config: ExtensionConfig;
+  readonly issues: readonly string[];
+}
+
 export function registerOpenConnectionSettingsCommand(context: vscode.ExtensionContext): void {
   let panel: vscode.WebviewPanel | undefined;
+  let panelDisposables: vscode.Disposable[] = [];
 
   const disposable = vscode.commands.registerCommand('postgresSchemaCompare.openConnectionSettings', () => {
     if (panel) {
@@ -50,54 +53,70 @@ export function registerOpenConnectionSettingsCommand(context: vscode.ExtensionC
       }
     );
 
-    panel.webview.html = renderConnectionSettingsHtml(panel.webview, getExtensionConfig());
+    panel.webview.html = renderConnectionSettingsHtml(getExtensionConfig());
 
-    panel.webview.onDidReceiveMessage(
-      async (message: ConnectionSettingsMessage) => {
-        if (message.type === 'chooseSchemaFolder') {
-          await chooseSchemaFolder(panel?.webview);
-          return;
-        }
-
-        if (message.type === 'testConnection') {
-          await testConnection(panel?.webview, message);
-          return;
-        }
-
-        if (message.type !== 'save') {
-          return;
-        }
-
-        try {
-          await updateExtensionConfig({
-            host: message.host,
-            port: parsePort(message.port),
-            database: message.database,
-            username: message.username,
-            password: message.password,
-            schemaFolder: message.schemaFolder
-          });
-
-          await vscode.window.showInformationMessage('PostgreSQL connection settings saved.');
-        } catch (error) {
-          const details = error instanceof Error ? error.message : String(error);
-          await vscode.window.showErrorMessage(`Unable to save PostgreSQL connection settings: ${details}`);
-        }
-      },
-      undefined,
-      context.subscriptions
-    );
-
-    panel.onDidDispose(
-      () => {
+    panelDisposables = [
+      panel.webview.onDidReceiveMessage((message: ConnectionSettingsMessage) => handleConnectionSettingsMessage(panel?.webview, message)),
+      panel.onDidDispose(() => {
+        panelDisposables.forEach((item) => item.dispose());
+        panelDisposables = [];
         panel = undefined;
-      },
-      undefined,
-      context.subscriptions
-    );
+      })
+    ];
   });
 
   context.subscriptions.push(disposable);
+}
+
+async function handleConnectionSettingsMessage(
+  webview: vscode.Webview | undefined,
+  message: ConnectionSettingsMessage
+): Promise<void> {
+  try {
+    switch (message.type) {
+      case 'chooseSchemaFolder':
+        await chooseSchemaFolder(webview);
+        return;
+      case 'testConnection':
+        await testConnection(webview, message);
+        return;
+      case 'save':
+        await saveConnectionSettings(webview, message);
+        return;
+    }
+  } catch (error) {
+    const details = getErrorMessage(error);
+    await webview?.postMessage({
+      type: 'operationResult',
+      operation: 'error',
+      ok: false,
+      message: details
+    });
+    await vscode.window.showErrorMessage(`PostgreSQL Schema Compare: ${details}`);
+  }
+}
+
+async function saveConnectionSettings(webview: vscode.Webview | undefined, message: SaveConnectionSettingsMessage): Promise<void> {
+  const validation = validateConnectionSettings(message);
+
+  if (validation.issues.length > 0) {
+    await webview?.postMessage({
+      type: 'operationResult',
+      operation: 'save',
+      ok: false,
+      message: validation.issues.join(' ')
+    });
+    return;
+  }
+
+  await updateExtensionConfig(validation.config);
+  await webview?.postMessage({
+    type: 'operationResult',
+    operation: 'save',
+    ok: true,
+    message: 'Connection settings saved.'
+  });
+  await vscode.window.showInformationMessage('PostgreSQL connection settings saved.');
 }
 
 async function chooseSchemaFolder(webview: vscode.Webview | undefined): Promise<void> {
@@ -111,6 +130,12 @@ async function chooseSchemaFolder(webview: vscode.Webview | undefined): Promise<
 
   const selectedFolder = selectedFolders?.[0];
   if (!selectedFolder) {
+    await webview?.postMessage({
+      type: 'operationResult',
+      operation: 'chooseSchemaFolder',
+      ok: true,
+      message: 'Folder selection cancelled.'
+    });
     return;
   }
 
@@ -131,42 +156,79 @@ function toWorkspaceRelativePath(folderUri: vscode.Uri): string {
 }
 
 async function testConnection(webview: vscode.Webview | undefined, message: TestConnectionSettingsMessage): Promise<void> {
+  const validation = validateConnectionSettings(message);
+
+  if (validation.issues.length > 0) {
+    await webview?.postMessage({
+      type: 'operationResult',
+      operation: 'testConnection',
+      ok: false,
+      message: validation.issues.join(' ')
+    });
+    return;
+  }
+
   try {
-    await new PostgresSchemaService({
-      host: message.host.trim(),
-      port: parsePort(message.port),
-      database: message.database.trim(),
-      username: message.username.trim(),
-      password: message.password
-    }).testConnection();
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: 'Testing PostgreSQL connection...',
+        cancellable: false
+      },
+      () => new PostgresSchemaService(validation.config).testConnection()
+    );
 
     await webview?.postMessage({
-      type: 'connectionTestResult',
+      type: 'operationResult',
+      operation: 'testConnection',
       ok: true,
       message: 'Connection successful.'
     });
   } catch (error) {
-    const details = error instanceof Error ? error.message : String(error);
-
     await webview?.postMessage({
-      type: 'connectionTestResult',
+      type: 'operationResult',
+      operation: 'testConnection',
       ok: false,
-      message: details
+      message: getErrorMessage(error)
     });
   }
 }
 
-function parsePort(value: string): number {
-  const port = Number.parseInt(value, 10);
+function validateConnectionSettings(message: ConnectionSettingsFormMessage): ValidationResult {
+  const config: ExtensionConfig = {
+    host: message.host.trim(),
+    port: parsePort(message.port),
+    database: message.database.trim(),
+    username: message.username.trim(),
+    password: message.password,
+    schemaFolder: message.schemaFolder.trim()
+  };
+  const issues: string[] = [];
 
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new Error('Port must be a number between 1 and 65535.');
+  if (!config.host) {
+    issues.push('Host is required.');
   }
 
-  return port;
+  if (!config.database) {
+    issues.push('Database is required.');
+  }
+
+  if (!config.username) {
+    issues.push('Username is required.');
+  }
+
+  if (!Number.isInteger(config.port) || config.port <= 0 || config.port > 65535) {
+    issues.push('Port must be a number between 1 and 65535.');
+  }
+
+  return { config, issues };
 }
 
-function renderConnectionSettingsHtml(webview: vscode.Webview, config: ReturnType<typeof getExtensionConfig>): string {
+function parsePort(value: string): number {
+  return Number(value);
+}
+
+function renderConnectionSettingsHtml(config: ExtensionConfig): string {
   const nonce = createNonce();
 
   return `<!DOCTYPE html>
@@ -174,61 +236,67 @@ function renderConnectionSettingsHtml(webview: vscode.Webview, config: ReturnTyp
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
   <title>PostgreSQL Connection</title>
-  <style>
+  <style nonce="${nonce}">
+    :root {
+      color-scheme: light dark;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
     body {
-      color: var(--vscode-foreground);
       background: var(--vscode-editor-background);
+      color: var(--vscode-foreground);
       font-family: var(--vscode-font-family);
       font-size: var(--vscode-font-size);
       margin: 0;
-      padding: 28px;
+      padding: 24px;
     }
 
     main {
-      max-width: 820px;
+      max-width: 880px;
     }
 
     header {
-      align-items: center;
       border-bottom: 1px solid var(--vscode-panel-border);
-      display: flex;
-      justify-content: space-between;
       margin-bottom: 20px;
-      padding-bottom: 12px;
+      padding-bottom: 16px;
     }
 
     h1 {
       font-size: 20px;
       font-weight: 600;
-      margin: 0;
+      line-height: 1.3;
+      margin: 0 0 5px;
     }
 
-    .subtitle {
+    .subtitle,
+    .hint {
       color: var(--vscode-descriptionForeground);
-      margin-top: 4px;
+      line-height: 1.45;
     }
 
     form {
       display: grid;
-      gap: 22px;
+      gap: 20px;
     }
 
     fieldset {
-      border: 0;
+      border: 1px solid var(--vscode-panel-border);
       display: grid;
       gap: 14px;
       margin: 0;
-      padding: 0;
+      padding: 16px;
     }
 
     legend {
       color: var(--vscode-foreground);
       font-size: 13px;
       font-weight: 600;
-      margin-bottom: 2px;
-      padding: 0;
+      padding: 0 6px;
     }
 
     label {
@@ -240,68 +308,100 @@ function renderConnectionSettingsHtml(webview: vscode.Webview, config: ReturnTyp
     .label-row {
       align-items: center;
       display: flex;
-      justify-content: space-between;
       gap: 8px;
+      justify-content: space-between;
     }
 
-    .input-with-button {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 34px;
-      gap: 6px;
-    }
-
-    input {
-      box-sizing: border-box;
-      width: 100%;
-      color: var(--vscode-input-foreground);
-      background: var(--vscode-input-background);
-      border: 1px solid var(--vscode-input-border, transparent);
-      border-radius: 2px;
-      padding: 8px 10px;
-      font-family: var(--vscode-editor-font-family);
-      font-size: 13px;
-    }
-
-    input:focus {
-      outline: 1px solid var(--vscode-focusBorder);
-      outline-offset: -1px;
-    }
-
-    .hint {
-      color: var(--vscode-descriptionForeground);
-      font-size: 12px;
-      font-weight: 400;
-      line-height: 1.45;
+    .required {
+      color: var(--vscode-errorForeground);
+      font-weight: 600;
     }
 
     .row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
       gap: 14px;
+      grid-template-columns: minmax(0, 1fr) minmax(120px, 180px);
+    }
+
+    .input-with-button {
+      display: grid;
+      gap: 6px;
+      grid-template-columns: minmax(0, 1fr) 34px;
+    }
+
+    input {
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border, transparent);
+      color: var(--vscode-input-foreground);
+      font-family: var(--vscode-editor-font-family);
+      font-size: 13px;
+      line-height: 1.4;
+      min-height: 32px;
+      padding: 6px 8px;
+      width: 100%;
+    }
+
+    input:focus {
+      border-color: var(--vscode-focusBorder);
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
+
+    input:invalid {
+      border-color: var(--vscode-inputValidation-errorBorder);
+    }
+
+    .hint {
+      font-size: 12px;
+      font-weight: 400;
     }
 
     .actions {
+      align-items: center;
       display: flex;
+      flex-wrap: wrap;
       gap: 10px;
       justify-content: flex-end;
-      margin-top: 2px;
     }
 
     button {
-      color: var(--vscode-button-foreground);
       background: var(--vscode-button-background);
       border: 0;
-      border-radius: 2px;
+      color: var(--vscode-button-foreground);
       cursor: pointer;
-      padding: 8px 14px;
+      min-height: 32px;
+      padding: 6px 13px;
+    }
+
+    button:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+
+    button:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 2px;
+    }
+
+    button:disabled {
+      cursor: default;
+      opacity: 0.55;
+    }
+
+    .secondary {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+    }
+
+    .secondary:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
     }
 
     .icon-button {
       align-items: center;
       display: inline-flex;
       justify-content: center;
-      min-height: 32px;
       padding: 0;
+      width: 34px;
     }
 
     .icon-button svg {
@@ -310,32 +410,47 @@ function renderConnectionSettingsHtml(webview: vscode.Webview, config: ReturnTyp
       width: 17px;
     }
 
-    button:hover {
-      background: var(--vscode-button-hoverBackground);
-    }
-
-    .secondary {
-      color: var(--vscode-button-secondaryForeground);
-      background: var(--vscode-button-secondaryBackground);
-    }
-
-    .secondary:hover {
-      background: var(--vscode-button-secondaryHoverBackground);
-    }
-
-    #status {
-      min-height: 18px;
+    .status {
+      border-left: 3px solid var(--vscode-panel-border);
       color: var(--vscode-descriptionForeground);
-      text-align: right;
+      min-height: 34px;
+      padding: 7px 10px;
+    }
+
+    .status[data-tone="success"] {
+      border-left-color: var(--vscode-testing-iconPassed);
+      color: var(--vscode-testing-iconPassed);
+    }
+
+    .status[data-tone="error"] {
+      border-left-color: var(--vscode-errorForeground);
+      color: var(--vscode-errorForeground);
+    }
+
+    .status[data-tone="progress"] {
+      border-left-color: var(--vscode-progressBar-background);
     }
 
     @media (max-width: 640px) {
       body {
-        padding: 18px;
+        padding: 16px;
       }
 
-      .row {
+      .row,
+      .input-with-button {
         grid-template-columns: 1fr;
+      }
+
+      .actions {
+        justify-content: stretch;
+      }
+
+      .actions button {
+        flex: 1 1 180px;
+      }
+
+      .icon-button {
+        width: 100%;
       }
     }
   </style>
@@ -343,65 +458,74 @@ function renderConnectionSettingsHtml(webview: vscode.Webview, config: ReturnTyp
 <body>
   <main>
     <header>
-      <div>
-        <h1>PostgreSQL Connection</h1>
-        <div class="subtitle">Configure the database used by schema compare.</div>
-      </div>
+      <h1>PostgreSQL Connection</h1>
+      <div class="subtitle">Set the live database and schema folder used by comparisons and sync actions.</div>
     </header>
-    <form id="connection-form">
+
+    <form id="connection-form" novalidate>
       <fieldset>
-        <legend>Connection</legend>
+        <legend>Database</legend>
         <div class="row">
-          <label>
-            Host
-            <input id="host" type="text" value="${escapeAttribute(config.host)}" placeholder="localhost" autocomplete="off">
+          <label for="host">
+            <span>Host <span class="required" aria-hidden="true">*</span></span>
+            <input id="host" name="host" type="text" value="${escapeAttribute(config.host)}" placeholder="localhost" autocomplete="off" required>
           </label>
 
-          <label>
-            Port
-            <input id="port" type="number" min="1" max="65535" value="${escapeAttribute(String(config.port))}" placeholder="5432" autocomplete="off">
+          <label for="port">
+            <span>Port <span class="required" aria-hidden="true">*</span></span>
+            <input id="port" name="port" type="number" min="1" max="65535" step="1" inputmode="numeric" value="${escapeAttribute(String(config.port))}" placeholder="5432" autocomplete="off" required>
           </label>
         </div>
 
         <div class="row">
-          <label>
-            Database
-            <input id="database" type="text" value="${escapeAttribute(config.database)}" placeholder="postgres" autocomplete="off">
+          <label for="database">
+            <span>Database <span class="required" aria-hidden="true">*</span></span>
+            <input id="database" name="database" type="text" value="${escapeAttribute(config.database)}" placeholder="postgres" autocomplete="off" required>
           </label>
 
-          <label>
-            Username
-            <input id="username" type="text" value="${escapeAttribute(config.username)}" placeholder="postgres" autocomplete="off">
+          <label for="username">
+            <span>Username <span class="required" aria-hidden="true">*</span></span>
+            <input id="username" name="username" type="text" value="${escapeAttribute(config.username)}" placeholder="postgres" autocomplete="username" required>
           </label>
         </div>
 
-        <label>
+        <label for="password">
           Password
-          <input id="password" type="text" value="${escapeAttribute(config.password)}" placeholder="password" autocomplete="off">
-          <span class="hint">Saved to this workspace's VS Code settings for now. Avoid committing workspace settings that contain credentials.</span>
+          <div class="input-with-button">
+            <input id="password" name="password" type="password" value="${escapeAttribute(config.password)}" placeholder="Optional password" autocomplete="current-password">
+            <button id="toggle-password" class="secondary icon-button" type="button" title="Show password" aria-label="Show password" aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+                <circle cx="12" cy="12" r="2.8" stroke="currentColor" stroke-width="1.7"/>
+              </svg>
+            </button>
+          </div>
+          <span class="hint">Stored in VS Code settings. Keep workspace settings with passwords out of source control.</span>
         </label>
       </fieldset>
 
       <fieldset>
-        <label>
+        <legend>Local schema files</legend>
+        <label for="schemaFolder">
           <span class="label-row">
             Schema folder
-            <button id="choose-schema-folder" class="secondary icon-button" type="button" title="Choose Schema Folder" aria-label="Choose Schema Folder">
+            <button id="choose-schema-folder" class="secondary icon-button" type="button" title="Choose schema folder" aria-label="Choose schema folder">
               <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H9l2 2h7.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5v-10Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
               </svg>
             </button>
           </span>
-          <input id="schemaFolder" type="text" value="${escapeAttribute(config.schemaFolder)}" placeholder="Select or enter a schema folder path">
+          <input id="schemaFolder" name="schemaFolder" type="text" value="${escapeAttribute(config.schemaFolder)}" placeholder="schema">
+          <span class="hint">Use a workspace-relative path when the folder is inside the current workspace.</span>
         </label>
       </fieldset>
 
-      <div class="actions">
-        <button type="submit">Save</button>
-        <button id="test-connection" class="secondary" type="button">Test Connection</button>
-      </div>
+      <div id="status" class="status" role="status" aria-live="polite">Required fields are marked with an asterisk.</div>
 
-      <div id="status" role="status"></div>
+      <div class="actions">
+        <button id="test-connection" class="secondary" type="button">Test Connection</button>
+        <button id="save-settings" type="submit">Save Settings</button>
+      </div>
     </form>
   </main>
 
@@ -415,48 +539,96 @@ function renderConnectionSettingsHtml(webview: vscode.Webview, config: ReturnTyp
     const password = document.getElementById('password');
     const schemaFolder = document.getElementById('schemaFolder');
     const status = document.getElementById('status');
+    const saveSettings = document.getElementById('save-settings');
     const testConnection = document.getElementById('test-connection');
     const chooseSchemaFolder = document.getElementById('choose-schema-folder');
+    const togglePassword = document.getElementById('toggle-password');
+
+    function getFormValues() {
+      return {
+        host: host.value.trim(),
+        port: port.value.trim(),
+        database: database.value.trim(),
+        username: username.value.trim(),
+        password: password.value,
+        schemaFolder: schemaFolder.value.trim()
+      };
+    }
+
+    function getValidationMessage() {
+      const values = getFormValues();
+      const issues = [];
+      const parsedPort = Number(values.port);
+
+      if (!values.host) {
+        issues.push('Host is required.');
+      }
+
+      if (!values.database) {
+        issues.push('Database is required.');
+      }
+
+      if (!values.username) {
+        issues.push('Username is required.');
+      }
+
+      if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+        issues.push('Port must be a number between 1 and 65535.');
+      }
+
+      return issues.join(' ');
+    }
+
+    function setStatus(message, tone) {
+      status.textContent = message;
+      status.dataset.tone = tone;
+    }
+
+    function setBusy(isBusy) {
+      saveSettings.disabled = isBusy;
+      testConnection.disabled = isBusy;
+      chooseSchemaFolder.disabled = isBusy;
+      togglePassword.disabled = isBusy;
+    }
+
+    function postFormMessage(type) {
+      const validationMessage = getValidationMessage();
+
+      if (validationMessage) {
+        setStatus(validationMessage, 'error');
+        return;
+      }
+
+      setBusy(true);
+      setStatus(type === 'save' ? 'Saving settings...' : 'Testing connection...', 'progress');
+      vscode.postMessage({
+        type,
+        ...getFormValues()
+      });
+    }
 
     form.addEventListener('submit', (event) => {
       event.preventDefault();
-
-      vscode.postMessage({
-        type: 'save',
-        host: host.value,
-        port: port.value,
-        database: database.value,
-        username: username.value,
-        password: password.value,
-        schemaFolder: schemaFolder.value
-      });
-
-      status.textContent = 'Saving...';
-      window.setTimeout(() => {
-        status.textContent = 'Saved.';
-      }, 250);
+      postFormMessage('save');
     });
 
     testConnection.addEventListener('click', () => {
-      status.textContent = 'Testing connection...';
-      testConnection.disabled = true;
-
-      vscode.postMessage({
-        type: 'testConnection',
-        host: host.value,
-        port: port.value,
-        database: database.value,
-        username: username.value,
-        password: password.value,
-        schemaFolder: schemaFolder.value
-      });
+      postFormMessage('testConnection');
     });
 
     chooseSchemaFolder.addEventListener('click', () => {
-      status.textContent = 'Choosing schema folder...';
+      setStatus('Opening folder picker...', 'progress');
       vscode.postMessage({
         type: 'chooseSchemaFolder'
       });
+    });
+
+    togglePassword.addEventListener('click', () => {
+      const isHidden = password.type === 'password';
+      password.type = isHidden ? 'text' : 'password';
+      togglePassword.setAttribute('aria-pressed', String(isHidden));
+      togglePassword.title = isHidden ? 'Hide password' : 'Show password';
+      togglePassword.setAttribute('aria-label', togglePassword.title);
     });
 
     window.addEventListener('message', (event) => {
@@ -464,28 +636,37 @@ function renderConnectionSettingsHtml(webview: vscode.Webview, config: ReturnTyp
 
       if (message.type === 'schemaFolderSelected') {
         schemaFolder.value = message.schemaFolder;
-        status.textContent = 'Schema folder selected.';
+        setStatus('Schema folder selected.', 'success');
         return;
       }
 
-      if (message.type !== 'connectionTestResult') {
+      if (message.type !== 'operationResult') {
         return;
       }
 
-      testConnection.disabled = false;
-      status.textContent = message.ok ? message.message : 'Connection failed: ' + message.message;
+      setBusy(false);
+      setStatus(message.message, message.ok ? 'success' : 'error');
     });
   </script>
 </body>
 </html>`;
 }
 
-function escapeAttribute(value: string): string {
+function escapeHtml(value: string): string {
   return value
     .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeAttribute(value: string): string {
+  return escapeHtml(value);
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function createNonce(): string {
