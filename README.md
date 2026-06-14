@@ -18,6 +18,19 @@ It provides a database object explorer, local-vs-live diff views, full folder co
 - Write/export database objects to the schema folder.
 - Reveal configured schema folders and object folders in the OS file explorer.
 
+## What's New in v0.1.0
+
+`v0.1.0` is a major schema coverage update from the `addmorefields` branch.
+
+- Expanded supported PostgreSQL object types to materialized views, indexes, procedures, triggers, and types.
+- Updated the object explorer, sidebar context menus, folder comparison view, and export flow for the expanded object set.
+- Improved migration plan ordering across dependent object types so generated scripts handle types, sequences, tables, indexes, views, materialized views, functions, procedures, and triggers in a safer order.
+- Improved table migration plans so affected foreign keys are dropped and re-added around referenced key or changed-column constraints instead of using broad table rebuilds.
+- Ignored constraint-backed indexes as standalone local-only differences to reduce noisy folder comparison results.
+- Added loading, empty, and error states to the folder comparison webview.
+- Improved the connection settings webview with stricter validation, clearer status feedback, password visibility controls, and a stricter content security policy.
+- Hid diff-related editor title actions from webviews where those actions are not relevant.
+
 ## Requirements
 
 - Visual Studio Code `1.90.0` or newer.
@@ -38,6 +51,22 @@ The extension stores these settings:
 | `postgresSchemaCompare.username` | PostgreSQL username. |
 | `postgresSchemaCompare.password` | PostgreSQL password. Prefer workspace-local settings outside source control. |
 | `postgresSchemaCompare.schemaFolder` | Relative or absolute folder used for local schema files. |
+
+## Supported Object Types
+
+`v0.1.0` supports these PostgreSQL object types in the object explorer, folder comparison, export, and migration plan flows:
+
+| Object type | Folder name |
+| --- | --- |
+| Tables | `Tables` |
+| Views | `Views` |
+| Materialized views | `Materialized Views` |
+| Indexes | `Indexes` |
+| Functions | `Functions` |
+| Procedures | `Procedures` |
+| Sequences | `Sequences` |
+| Triggers | `Triggers` |
+| Types | `Types` |
 
 ## Schema Folder Layout
 
@@ -78,22 +107,6 @@ schema/
 
 Set `postgresSchemaCompare.schemaFolder` to `schema` for the example above.
 
-The extension also supports the older single-schema layout:
-
-```text
-schema/
-  Tables/
-    public.users.sql
-  Views/
-  Materialized Views/
-  Indexes/
-  Functions/
-  Procedures/
-  Sequences/
-  Triggers/
-  Types/
-```
-
 ## Usage
 
 ### Configure and Load the Object Explorer
@@ -132,7 +145,7 @@ For tables, the comparison is table-aware. Column order alone is ignored, so a r
 
 Use **Compare Folder with Database** from the object explorer title bar.
 
-The **Schema Folder vs Database** view lists every difference and provides an action dropdown for each row:
+The **Schema Folder vs Database** view shows a loading state while comparison is running, an empty state when the folder matches the live database, and an error state when comparison fails. When differences exist, it provides an action dropdown for each row:
 
 - **Compare**: open the VS Code diff view.
 - **Migration Plan**: open the generated SQL plan for that row.
@@ -174,7 +187,11 @@ Supported table changes include:
 
 When changing text-like columns to `jsonb`, generated SQL includes a `USING` clause so PostgreSQL can perform the conversion.
 
+When table key constraints or changed columns affect foreign keys, generated plans drop the affected foreign keys before the table changes and re-add them afterward.
+
 For modified non-table objects, the migration plan replaces the object using drop-and-create style SQL where supported by the extension.
+
+Combined migration plans are ordered by object type and table dependencies so prerequisite objects are created before dependent objects where practical. Constraint-backed indexes are treated as part of their owning constraints and are not reported as separate local-only index differences.
 
 Review generated migration plans before applying them to important databases.
 
