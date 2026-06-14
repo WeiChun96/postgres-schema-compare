@@ -2,7 +2,7 @@
 
 ## v0.1.0
 
-Major update from the `addmorefields` branch.
+Major update.
 
 - Expand PostgreSQL object support beyond tables, views, functions, and sequences to include materialized views, indexes, procedures, triggers, and types.
 - Enhance database object discovery, object tree grouping, context menu targeting, and schema folder conventions for the expanded object set.
