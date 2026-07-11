@@ -725,7 +725,7 @@ function areMapsEquivalent<T>(
 }
 
 function areColumnsEquivalent(left: ParsedColumn, right: ParsedColumn): boolean {
-  return normalizeTypeName(left.type) === normalizeTypeName(right.type)
+  return normalizeColumnType(left.type) === normalizeColumnType(right.type)
     && normalizeSqlFragment(left.defaultValue ?? '') === normalizeSqlFragment(right.defaultValue ?? '')
     && left.notNull === right.notNull
     && normalizeSqlFragment(left.identity ?? '') === normalizeSqlFragment(right.identity ?? '');
@@ -783,7 +783,7 @@ function describeTableDefinitionChanges(liveSql: string, localSql: string): stri
 function describeColumnChanges(liveColumn: ParsedColumn, localColumn: ParsedColumn): string[] {
   const changes: string[] = [];
 
-  if (normalizeTypeName(liveColumn.type) !== normalizeTypeName(localColumn.type)) {
+  if (normalizeColumnType(liveColumn.type) !== normalizeColumnType(localColumn.type)) {
     changes.push(`type ${liveColumn.type} -> ${localColumn.type}`);
   }
 
@@ -1570,6 +1570,12 @@ function getTypeMigrationUsingClause(columnName: string, liveColumn: ParsedColum
 
 function normalizeTypeName(value: string): string {
   return normalizeSqlFragment(value).replace(/\(.+\)$/, '').trim();
+}
+
+function normalizeColumnType(value: string): string {
+  return normalizeSqlFragment(value)
+    .replace(/^varchar(?=\s|\(|$)/, 'character varying')
+    .replace(/^char(?=\s|\(|$)/, 'character');
 }
 
 function isTextType(value: string): boolean {
