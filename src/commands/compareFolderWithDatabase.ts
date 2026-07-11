@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { DiffSessionState } from '../services/diffSessionState';
 import { isSchemaRef, SchemaComparisonRef, SchemaComparisonResult, SchemaComparisonStatus, SchemaDiffService } from '../services/schemaDiffService';
 import { ServiceFactory } from '../services/serviceFactory';
-import { SchemaObjectKind } from '../model/schemaObject';
+import { SchemaObjectRef } from '../model/schemaObject';
 
 type FilterableComparisonStatus = Extract<SchemaComparisonStatus, 'modified' | 'missingLocal' | 'localOnly'>;
 
@@ -14,6 +14,7 @@ type RowComparisonMessage = {
 type BulkComparisonMessage = {
   readonly type: 'bulkUpdateFolder' | 'bulkMigrationPlan' | 'bulkUpdateDatabase';
   readonly status?: FilterableComparisonStatus;
+  readonly schema?: string;
 };
 
 type ComparisonMessage = RowComparisonMessage | BulkComparisonMessage;
@@ -26,7 +27,7 @@ export function registerCompareFolderWithDatabaseCommand(
   context: vscode.ExtensionContext,
   serviceFactory: ServiceFactory,
   diffSessionState: DiffSessionState,
-  onSynced: (kind: SchemaObjectKind) => Promise<void> | void
+  onSynced: (ref: SchemaObjectRef) => Promise<void> | void
 ): void {
   const disposable = vscode.commands.registerCommand(
     'postgresSchemaCompare.compareFolderWithDatabase',
@@ -49,17 +50,17 @@ export function registerCompareFolderWithDatabaseCommand(
           async (message: ComparisonMessage) => {
             try {
               if (message.type === 'bulkUpdateFolder') {
-                await updateAllFolderDifferences(panel.webview, diffService, resultById, onSynced, message.status);
+                await updateAllFolderDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema);
                 return;
               }
 
               if (message.type === 'bulkMigrationPlan') {
-                await openAllDatabaseMigrationPlan(diffService, resultById, message.status);
+                await openAllDatabaseMigrationPlan(diffService, resultById, message.status, message.schema);
                 return;
               }
 
               if (message.type === 'bulkUpdateDatabase') {
-                await updateAllDatabaseDifferences(panel.webview, diffService, resultById, onSynced, message.status);
+                await updateAllDatabaseDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema);
                 return;
               }
 
@@ -76,7 +77,7 @@ export function registerCompareFolderWithDatabaseCommand(
                 const didSync = await updateFolderFromResult(diffService, result);
 
                 if (didSync && !isSchemaRef(result.ref)) {
-                  await refreshComparisonView(panel.webview, diffService, resultById, result.ref.kind, onSynced);
+                  await refreshComparisonView(panel.webview, resultById, [result.ref], onSynced);
                 }
 
                 return;
@@ -86,9 +87,10 @@ export function registerCompareFolderWithDatabaseCommand(
                 const didSync = await updateDatabaseFromResult(diffService, result);
 
                 if (didSync && !isSchemaRef(result.ref)) {
-                  await refreshComparisonView(panel.webview, diffService, resultById, result.ref.kind, onSynced);
+                  await refreshComparisonView(panel.webview, resultById, [result.ref], onSynced);
                 } else if (didSync) {
-                  await refreshComparisonView(panel.webview, diffService, resultById, [], onSynced);
+                  resultById.delete(getResultId(result.ref));
+                  panel.webview.html = renderComparisonHtml(Array.from(resultById.values()));
                 }
 
                 return;
@@ -280,6 +282,7 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
   const rows = results.map(renderResultRow).join('');
   const hasResults = results.length > 0;
   const bulkActionOptions = getBulkActionOptions(results);
+  const schemas = Array.from(new Set(results.map((result) => result.ref.schema))).sort((left, right) => left.localeCompare(right));
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -580,8 +583,12 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
           <span class="count" data-count="error">${counts.error} error(s)</span>
         </div>
         <div class="toolbar">
-          <div class="filter-group" aria-label="Filter differences by status">
+          <div class="filter-group" aria-label="Filter differences">
             <div class="filter-label">Filter changes</div>
+            <select data-schema-filter aria-label="Filter by schema">
+              <option value="">All schemas</option>
+              ${schemas.map((schema) => `<option value="${escapeAttribute(schema)}">${escapeHtml(schema)}</option>`).join('')}
+            </select>
             <div class="filters">
               ${renderStatusFilterButton('modified', counts.modified)}
               ${renderStatusFilterButton('missingLocal', counts.missingLocal)}
@@ -622,6 +629,7 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     let activeFilter = undefined;
+    let activeSchema = undefined;
 
     function getVisibleRows() {
       return Array.from(document.querySelectorAll('tbody tr[data-id]')).filter((row) => !row.hidden);
@@ -648,9 +656,14 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
       }
 
       const visibleCount = getVisibleRows().length;
-      filterStatus.textContent = activeFilter
-        ? visibleCount + ' ' + getFilterLabel(activeFilter).toLowerCase() + ' change(s) shown. Press again to clear.'
-        : visibleCount + ' change(s) shown.';
+      const scopes = [];
+      if (activeSchema) {
+        scopes.push('in ' + activeSchema);
+      }
+      if (activeFilter) {
+        scopes.push('with status ' + getFilterLabel(activeFilter).toLowerCase());
+      }
+      filterStatus.textContent = visibleCount + ' change(s) shown' + (scopes.length ? ' ' + scopes.join(' ') : '') + '.';
     }
 
     function getFilterLabel(status) {
@@ -675,7 +688,10 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
 
       const rows = Array.from(document.querySelectorAll('tbody tr[data-id]'));
       for (const row of rows) {
-        row.hidden = Boolean(activeFilter && row.dataset.status !== activeFilter);
+        row.hidden = Boolean(
+          (activeFilter && row.dataset.status !== activeFilter)
+          || (activeSchema && row.dataset.schema !== activeSchema)
+        );
       }
 
       const filteredEmptyState = document.getElementById('filtered-empty-state');
@@ -707,7 +723,8 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
 
         vscode.postMessage({
           type: select.value,
-          status: activeFilter
+          status: activeFilter,
+          schema: activeSchema
         });
         return;
       }
@@ -729,6 +746,13 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
       });
     });
 
+    document.querySelector('select[data-schema-filter]')?.addEventListener('change', (event) => {
+      activeSchema = event.target.value || undefined;
+      const currentStatusFilter = activeFilter;
+      activeFilter = undefined;
+      applyFilter(currentStatusFilter);
+    });
+
     updateFilterStatus();
     updateBulkActionState();
   </script>
@@ -742,7 +766,7 @@ function renderResultRow(result: SchemaComparisonResult): string {
   const signature = !isSchemaRef(result.ref) && result.ref.identityArguments ? `(${result.ref.identityArguments})` : '';
   const objectLabel = isSchemaRef(result.ref) ? result.ref.schema : `${result.ref.schema}.${result.ref.name}${signature}`;
 
-  return `<tr class="${escapeAttribute(result.status)}" data-id="${escapeAttribute(id)}" data-status="${escapeAttribute(result.status)}">
+  return `<tr class="${escapeAttribute(result.status)}" data-id="${escapeAttribute(id)}" data-status="${escapeAttribute(result.status)}" data-schema="${escapeAttribute(result.ref.schema)}">
     <td><span class="badge ${escapeAttribute(result.status)}">${escapeHtml(getStatusLabel(result.status))}</span></td>
     <td class="object">${escapeHtml(objectLabel)}</td>
     <td class="kind">${escapeHtml(result.ref.kind)}</td>
@@ -901,11 +925,12 @@ async function updateAllFolderDifferences(
   webview: vscode.Webview,
   diffService: SchemaDiffService,
   resultById: Map<string, SchemaComparisonResult>,
-  onSynced: (kind: SchemaObjectKind) => Promise<void> | void,
-  status?: FilterableComparisonStatus
+  onSynced: (ref: SchemaObjectRef) => Promise<void> | void,
+  status?: FilterableComparisonStatus,
+  schema?: string
 ): Promise<void> {
-  const results = getActionableResults(resultById, status);
-  const syncedKinds = new Set<SchemaObjectKind>();
+  const results = getActionableResults(resultById, status, schema);
+  const syncedRefs: SchemaObjectRef[] = [];
 
   for (const result of results) {
     if (isSchemaRef(result.ref)) {
@@ -915,12 +940,12 @@ async function updateAllFolderDifferences(
     const didSync = await updateFolderFromResult(diffService, result);
 
     if (didSync) {
-      syncedKinds.add(result.ref.kind);
+      syncedRefs.push(result.ref);
     }
   }
 
-  if (syncedKinds.size > 0) {
-    await refreshComparisonView(webview, diffService, resultById, Array.from(syncedKinds), onSynced);
+  if (syncedRefs.length > 0) {
+    await refreshComparisonView(webview, resultById, syncedRefs, onSynced);
   }
 }
 
@@ -928,20 +953,21 @@ async function updateAllDatabaseDifferences(
   webview: vscode.Webview,
   diffService: SchemaDiffService,
   resultById: Map<string, SchemaComparisonResult>,
-  onSynced: (kind: SchemaObjectKind) => Promise<void> | void,
-  status?: FilterableComparisonStatus
+  onSynced: (ref: SchemaObjectRef) => Promise<void> | void,
+  status?: FilterableComparisonStatus,
+  schema?: string
 ): Promise<void> {
-  const results = getActionableResults(resultById, status);
-  const syncedKinds = new Set<SchemaObjectKind>();
+  const results = getActionableResults(resultById, status, schema);
+  const syncedRefs: SchemaObjectRef[] = [];
 
   for (const result of results) {
     if (!isSchemaRef(result.ref)) {
-      syncedKinds.add(result.ref.kind);
+      syncedRefs.push(result.ref);
     }
   }
 
   const confirmed = await confirmAction(
-    `Apply the generated migration plan for ${getBulkScopeLabel(status)}${results.length} difference(s) to the live database?`,
+    `Apply the generated migration plan for ${getBulkScopeLabel(status, schema)}${results.length} difference(s) to the live database?`,
     'Update Database'
   );
 
@@ -954,16 +980,21 @@ async function updateAllDatabaseDifferences(
     () => diffService.updateDatabaseFromMigrationPlan(results)
   );
 
-  if (syncedKinds.size > 0) {
-    await refreshComparisonView(webview, diffService, resultById, Array.from(syncedKinds), onSynced);
+  if (syncedRefs.length > 0) {
+    await refreshComparisonView(webview, resultById, syncedRefs, onSynced);
   }
 }
 
 function getActionableResults(
   resultById: ReadonlyMap<string, SchemaComparisonResult>,
-  status?: FilterableComparisonStatus
+  status?: FilterableComparisonStatus,
+  schema?: string
 ): SchemaComparisonResult[] {
-  return Array.from(resultById.values()).filter((result) => result.status !== 'error' && (!status || result.status === status));
+  return Array.from(resultById.values()).filter((result) =>
+    result.status !== 'error'
+    && (!status || result.status === status)
+    && (!schema || result.ref.schema === schema)
+  );
 }
 
 function getUpdateDatabaseConfirmationMessage(result: SchemaComparisonResult): string {
@@ -1000,11 +1031,12 @@ async function openDatabaseMigrationPlan(
 async function openAllDatabaseMigrationPlan(
   diffService: SchemaDiffService,
   resultById: ReadonlyMap<string, SchemaComparisonResult>,
-  status?: FilterableComparisonStatus
+  status?: FilterableComparisonStatus,
+  schema?: string
 ): Promise<void> {
-  const results = getActionableResults(resultById, status);
+  const results = getActionableResults(resultById, status, schema);
   const uri = await runActionWithProgress(
-    `Preparing ${status ? getStatusLabel(status).toLowerCase() : 'full'} database migration plan...`,
+    `Preparing ${getBulkScopeLabel(status, schema).trim() || 'full'} database migration plan...`,
     () => diffService.prepareDatabaseMigrationPlanForResults(results)
   );
 
@@ -1016,29 +1048,18 @@ async function openAllDatabaseMigrationPlan(
 
 async function refreshComparisonView(
   webview: vscode.Webview,
-  diffService: SchemaDiffService,
   resultById: Map<string, SchemaComparisonResult>,
-  syncedKinds: SchemaObjectKind | readonly SchemaObjectKind[],
-  onSynced: (kind: SchemaObjectKind) => Promise<void> | void
+  syncedRefs: readonly SchemaObjectRef[],
+  onSynced: (ref: SchemaObjectRef) => Promise<void> | void
 ): Promise<void> {
-  const changedResults = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: 'Refreshing Schema Folder vs Database...',
-      cancellable: false
-    },
-    async () => (await diffService.compareFolderWithDatabase()).filter((result) => result.status !== 'same')
-  );
-  resultById.clear();
-
-  for (const result of changedResults) {
-    resultById.set(getResultId(result.ref), result);
+  for (const ref of syncedRefs) {
+    resultById.delete(getResultId(ref));
   }
 
-  webview.html = renderComparisonHtml(changedResults);
+  webview.html = renderComparisonHtml(Array.from(resultById.values()));
 
-  for (const kind of Array.isArray(syncedKinds) ? syncedKinds : [syncedKinds]) {
-    await onSynced(kind);
+  for (const ref of syncedRefs) {
+    await onSynced(ref);
   }
 }
 
@@ -1078,8 +1099,10 @@ function getStatusLabel(status: SchemaComparisonStatus): string {
   }
 }
 
-function getBulkScopeLabel(status: FilterableComparisonStatus | undefined): string {
-  return status ? `${getStatusLabel(status).toLowerCase()} ` : '';
+function getBulkScopeLabel(status: FilterableComparisonStatus | undefined, schema?: string): string {
+  const parts = [schema ? `schema ${schema}` : undefined, status ? getStatusLabel(status).toLowerCase() : undefined]
+    .filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? `${parts.join(', ')} ` : '';
 }
 
 function getStatusDetail(status: SchemaComparisonStatus): string {

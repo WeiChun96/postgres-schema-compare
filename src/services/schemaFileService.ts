@@ -144,6 +144,41 @@ export class SchemaFileService {
     return objects.sort((left, right) => objectKey(left).localeCompare(objectKey(right)));
   }
 
+  public async listLocalObjectsInFolder(schema: string, kind: SchemaObjectRef['kind']): Promise<SchemaObjectRef[]> {
+    if (!this.schemaFolderName) {
+      throw new Error('Configure a schema folder before comparing local SQL files.');
+    }
+
+    const objects: SchemaObjectRef[] = [];
+    const folderName = schemaObjectFolderByKind[kind];
+    const schemaFolderUri = vscode.Uri.joinPath(this.schemaRoot, sanitizeFileSegment(schema), folderName);
+
+    for (const [fileName, fileType] of await this.tryReadDirectory(schemaFolderUri)) {
+      if (fileType !== vscode.FileType.File || isDotEntry(fileName) || !fileName.toLowerCase().endsWith('.sql')) {
+        continue;
+      }
+
+      objects.push(this.resolveObjectRefFromFile(vscode.Uri.joinPath(schemaFolderUri, fileName)));
+    }
+
+    if (schema === this.defaultSchema) {
+      const legacyFolderUri = vscode.Uri.joinPath(this.schemaRoot, folderName);
+
+      for (const [fileName, fileType] of await this.tryReadDirectory(legacyFolderUri)) {
+        if (fileType !== vscode.FileType.File || isDotEntry(fileName) || !fileName.toLowerCase().endsWith('.sql')) {
+          continue;
+        }
+
+        const object = this.resolveObjectRefFromFile(vscode.Uri.joinPath(legacyFolderUri, fileName));
+        if (object.kind === kind && object.schema === schema) {
+          objects.push(object);
+        }
+      }
+    }
+
+    return objects.sort((left, right) => objectKey(left).localeCompare(objectKey(right)));
+  }
+
   public async listLocalSchemas(): Promise<string[]> {
     if (!this.schemaFolderName) {
       throw new Error('Configure a schema folder before comparing local SQL files.');

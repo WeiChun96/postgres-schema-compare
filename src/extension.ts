@@ -42,8 +42,13 @@ export function activate(context: vscode.ExtensionContext): void {
   registerOpenConnectionSettingsCommand(context);
   registerCompareFileWithDatabaseCommand(context, serviceFactory, diffSessionState);
   registerSwapDiffDirectionCommand(context, serviceFactory, diffSessionState);
-  registerSyncActiveDiffCommands(context, serviceFactory, diffSessionState, () => databaseObjectsProvider.refresh());
-  registerCompareFolderWithDatabaseCommand(context, serviceFactory, diffSessionState, (kind) => databaseObjectsProvider.refreshKind(kind));
+  registerSyncActiveDiffCommands(
+    context,
+    serviceFactory,
+    diffSessionState,
+    (ref) => ref ? databaseObjectsProvider.refreshObject(ref) : databaseObjectsProvider.refresh()
+  );
+  registerCompareFolderWithDatabaseCommand(context, serviceFactory, diffSessionState, (ref) => databaseObjectsProvider.refreshObject(ref));
   registerCompareDatabaseObjectWithFolderCommand(context, serviceFactory, diffSessionState);
   registerExportDatabaseToFolderCommand(context, serviceFactory, () => databaseObjectsProvider.refresh(), outputChannel);
   registerRevealObjectInExplorerCommand(context, serviceFactory);
