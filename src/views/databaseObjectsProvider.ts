@@ -9,6 +9,7 @@ type ObjectComparisonStatus = 'same' | 'modified' | 'missingLocal' | 'localOnly'
 
 interface SidebarComparison {
   readonly objects: readonly SchemaObjectRef[];
+  readonly localOnlySchemas: readonly string[];
   readonly statuses: ReadonlyMap<string, ObjectComparisonStatus>;
 }
 
@@ -18,13 +19,14 @@ type ConnectionState =
   | {
       readonly status: 'connected';
       readonly objects: readonly SchemaObjectRef[];
+      readonly localOnlySchemas: readonly string[];
       readonly comparisonStatuses: ReadonlyMap<string, ObjectComparisonStatus>;
     }
   | { readonly status: 'failed'; readonly message: string };
 
 type DatabaseTreeNode =
   | { readonly type: 'connection'; readonly config: ExtensionConfig }
-  | { readonly type: 'schema'; readonly schema: string; readonly objects: readonly SchemaObjectRef[] }
+  | { readonly type: 'schema'; readonly schema: string; readonly objects: readonly SchemaObjectRef[]; readonly isLocalOnly: boolean }
   | {
       readonly type: 'folder';
       readonly schema: string;
@@ -131,6 +133,7 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
         ...currentState.objects.filter((object) => object.kind !== kind),
         ...comparison.objects
       ].sort((left, right) => getObjectKey(left).localeCompare(getObjectKey(right))),
+      localOnlySchemas: comparison.localOnlySchemas,
       comparisonStatuses: nextStatuses
     };
     this.changeEmitter.fire(undefined);
@@ -164,6 +167,7 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
         this.connectionState = {
           status: 'connected',
           objects: comparison.objects,
+          localOnlySchemas: comparison.localOnlySchemas,
           comparisonStatuses: comparison.statuses
         };
         this.changeEmitter.fire(undefined);
@@ -187,7 +191,11 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
     }
 
     if (node.type === 'connection') {
-      const schemas = Array.from(new Set(this.connectionState.objects.map((object) => object.schema))).sort();
+      const localOnlySchemas = new Set(this.connectionState.localOnlySchemas);
+      const schemas = Array.from(new Set([
+        ...this.connectionState.objects.map((object) => object.schema),
+        ...localOnlySchemas
+      ])).sort();
 
       if (schemas.length === 0) {
         return [{ type: 'empty', label: 'No user schemas found' }];
@@ -196,6 +204,7 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
       return schemas.map((schema) => ({
         type: 'schema',
         schema,
+        isLocalOnly: localOnlySchemas.has(schema),
         objects: this.connectionState.status === 'connected'
           ? this.connectionState.objects.filter((object) => object.schema === schema)
           : []
@@ -243,6 +252,7 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
     if (!config.schemaFolder) {
       return {
         objects: databaseObjects,
+        localOnlySchemas: [],
         statuses: new Map()
       };
     }
@@ -253,12 +263,16 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
     if (!workspaceFolder && !isAbsolutePath(config.schemaFolder)) {
       return {
         objects: databaseObjects,
+        localOnlySchemas: [],
         statuses
       };
     }
 
     const schemaFileService = new SchemaFileService(workspaceFolder, config.schemaFolder, 'public');
     const objectsByKey = new Map(databaseObjects.map((object) => [getObjectKey(object), object]));
+    const databaseSchemas = new Set(await postgresSchemaService.listSchemas());
+    const localSchemas = await schemaFileService.listLocalSchemas();
+    const localOnlySchemas = localSchemas.filter((schema) => !databaseSchemas.has(schema));
     const ignoredLocalOnlyObjectKeys = new Set((await postgresSchemaService.listConstraintBackedIndexes()).map(getLocalFileObjectKey));
 
     for (const object of databaseObjects) {
@@ -302,6 +316,7 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
 
     return {
       objects: Array.from(objectsByKey.values()).sort((left, right) => getObjectKey(left).localeCompare(getObjectKey(right))),
+      localOnlySchemas,
       statuses
     };
   }
@@ -322,8 +337,14 @@ function createConnectionItem(config: ExtensionConfig): vscode.TreeItem {
 
 function createSchemaItem(node: Extract<DatabaseTreeNode, { type: 'schema' }>): vscode.TreeItem {
   const item = new vscode.TreeItem(node.schema, vscode.TreeItemCollapsibleState.Collapsed);
-  item.description = 'schema';
-  item.iconPath = new vscode.ThemeIcon('symbol-namespace');
+  item.description = node.isLocalOnly ? 'schema - local only' : 'schema';
+  item.tooltip = node.isLocalOnly
+    ? `${node.schema} exists in the local schema folder but not in the live database.`
+    : `${node.schema} schema`;
+  item.iconPath = new vscode.ThemeIcon(
+    'symbol-namespace',
+    node.isLocalOnly ? new vscode.ThemeColor('charts.yellow') : undefined
+  );
   item.contextValue = 'postgresSchemaCompare.schema';
 
   return item;

@@ -217,6 +217,30 @@ export class PostgresSchemaService {
     });
   }
 
+  public async listSchemas(): Promise<string[]> {
+    return this.withClient(async (client) => {
+      const result = await client.query<{ schema: string }>(
+        `
+          select nspname as schema
+          from pg_namespace
+          where nspname not in ('pg_catalog', 'information_schema')
+            and nspname not like 'pg_toast%'
+          order by nspname
+        `
+      );
+
+      return result.rows.map((row) => row.schema);
+    });
+  }
+
+  public getCreateSchemaSql(schema: string): string {
+    return ensureTrailingNewline(`CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(schema)};`);
+  }
+
+  public async createSchema(schema: string): Promise<void> {
+    await this.executeSql(this.getCreateSchemaSql(schema));
+  }
+
   public async listConstraintBackedIndexes(): Promise<SchemaObjectRef[]> {
     return this.withClient(async (client) => {
       const result = await client.query<SchemaObjectRef>(

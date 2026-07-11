@@ -13,11 +13,23 @@ export type DiffDirection = 'databaseToLocal' | 'localToDatabase';
 
 export type SchemaComparisonStatus = 'modified' | 'missingLocal' | 'localOnly' | 'same' | 'error';
 
+export interface SchemaRef {
+  readonly kind: 'schema';
+  readonly schema: string;
+  readonly name: string;
+}
+
+export type SchemaComparisonRef = SchemaObjectRef | SchemaRef;
+
 export interface SchemaComparisonResult {
-  readonly ref: SchemaObjectRef;
+  readonly ref: SchemaComparisonRef;
   readonly status: SchemaComparisonStatus;
   readonly localUri?: vscode.Uri;
   readonly message?: string;
+}
+
+export function isSchemaRef(ref: SchemaComparisonRef): ref is SchemaRef {
+  return ref.kind === 'schema';
 }
 
 export interface ExportDatabaseResult {
@@ -63,8 +75,31 @@ export class SchemaDiffService {
     }
 
     if (result.status === 'localOnly') {
+      if (isSchemaRef(result.ref)) {
+        const localUri = this.liveDocumentProvider.setDocument(
+          this.postgresSchemaService.getCreateSchemaSql(result.ref.schema),
+          `${result.ref.schema}.schema.sql`
+        );
+        const liveUri = this.liveDocumentProvider.setDocument('', getEmptyDocumentFileName(result.ref, 'database'));
+
+        return createPreparedDiff(result.ref, liveUri, localUri, direction);
+      }
+
       const localUri = result.localUri ?? this.schemaFileService.getLocalObjectUri(result.ref);
       const liveUri = this.liveDocumentProvider.setDocument('', getEmptyDocumentFileName(result.ref, 'database'));
+
+      return createPreparedDiff(result.ref, liveUri, localUri, direction);
+    }
+
+    if (isSchemaRef(result.ref)) {
+      const liveUri = this.liveDocumentProvider.setDocument(
+        this.postgresSchemaService.getCreateSchemaSql(result.ref.schema),
+        `${result.ref.schema}.schema.sql`
+      );
+      const localUri = this.liveDocumentProvider.setDocument(
+        this.postgresSchemaService.getCreateSchemaSql(result.ref.schema),
+        `${result.ref.schema}.schema.local.sql`
+      );
 
       return createPreparedDiff(result.ref, liveUri, localUri, direction);
     }
@@ -73,11 +108,23 @@ export class SchemaDiffService {
   }
 
   public async compareFolderWithDatabase(): Promise<SchemaComparisonResult[]> {
+    const databaseSchemas = new Set(await this.postgresSchemaService.listSchemas());
+    const localSchemas = await this.schemaFileService.listLocalSchemas();
     const databaseObjects = await this.postgresSchemaService.listSchemaObjects();
     const localObjects = await this.schemaFileService.listLocalObjects();
     const databaseObjectsByLocalFileKey = new Map(databaseObjects.map((object) => [getLocalFileObjectKey(object), object]));
     const ignoredLocalOnlyObjectKeys = await this.getIgnoredLocalOnlyObjectKeys();
     const results: SchemaComparisonResult[] = [];
+
+    for (const localSchema of localSchemas) {
+      if (!databaseSchemas.has(localSchema)) {
+        results.push({
+          ref: { kind: 'schema', schema: localSchema, name: localSchema },
+          status: 'localOnly',
+          message: 'Local schema folder exists but the schema was not found in the database.'
+        });
+      }
+    }
 
     for (const databaseObject of databaseObjects) {
       const localUri = this.schemaFileService.getLocalObjectUri(databaseObject);
@@ -292,6 +339,16 @@ export class SchemaDiffService {
     result: SchemaComparisonResult,
     localTables?: ReadonlyMap<string, ParsedTableDefinition>
   ): Promise<MigrationPlanPhases> {
+    if (isSchemaRef(result.ref)) {
+      if (result.status === 'missingLocal') {
+        return createMigrationPlanPhases();
+      }
+
+      return createMigrationPlanPhases({
+        createSchemas: [this.postgresSchemaService.getCreateSchemaSql(result.ref.schema).trim()]
+      });
+    }
+
     if (result.status === 'missingLocal') {
       return createMigrationPlanPhases({
         other: [this.postgresSchemaService.getDropObjectSql(result.ref).trim()]
@@ -464,6 +521,10 @@ function sortMigrationResultsByTableDependencies(
 }
 
 function getMigrationSortRank(result: Pick<SchemaComparisonResult, 'ref' | 'status'>): number {
+  if (isSchemaRef(result.ref)) {
+    return 0;
+  }
+
   if (result.status === 'missingLocal') {
     switch (result.ref.kind) {
       case 'index':
@@ -503,7 +564,7 @@ function getMigrationSortRank(result: Pick<SchemaComparisonResult, 'ref' | 'stat
 }
 
 function createPreparedDiff(
-  ref: SchemaObjectRef,
+  ref: SchemaComparisonRef,
   liveUri: vscode.Uri,
   localUri: vscode.Uri,
   direction: DiffDirection
@@ -552,8 +613,8 @@ export class LiveSchemaDocumentProvider implements vscode.TextDocumentContentPro
   }
 }
 
-function getObjectKey(ref: SchemaObjectRef): string {
-  return `${ref.kind}:${ref.schema}.${ref.name}:${ref.identityArguments ?? ''}`;
+function getObjectKey(ref: SchemaComparisonRef): string {
+  return `${ref.kind}:${ref.schema}.${ref.name}:${isSchemaRef(ref) ? '' : ref.identityArguments ?? ''}`;
 }
 
 function getLocalFileObjectKey(ref: SchemaObjectRef): string {
@@ -626,6 +687,7 @@ interface ForeignKeyReference {
 }
 
 interface MigrationPlanPhases {
+  readonly createSchemas: string[];
   readonly dropForeignKeys: string[];
   readonly dropPrimaryUniqueCheckConstraints: string[];
   readonly alterColumns: string[];
@@ -963,6 +1025,7 @@ function doesConstraintUseAnyColumn(constraint: ParsedConstraint, columnNames: R
 
 function createMigrationPlanPhases(values?: Partial<MigrationPlanPhases>): MigrationPlanPhases {
   return {
+    createSchemas: values?.createSchemas ?? [],
     dropForeignKeys: values?.dropForeignKeys ?? [],
     dropPrimaryUniqueCheckConstraints: values?.dropPrimaryUniqueCheckConstraints ?? [],
     alterColumns: values?.alterColumns ?? [],
@@ -973,6 +1036,7 @@ function createMigrationPlanPhases(values?: Partial<MigrationPlanPhases>): Migra
 }
 
 function appendMigrationPlanPhases(target: MigrationPlanPhases, source: MigrationPlanPhases, comment: string): void {
+  appendPhase(target.createSchemas, source.createSchemas, comment);
   appendPhase(target.dropForeignKeys, source.dropForeignKeys, comment);
   appendPhase(target.dropPrimaryUniqueCheckConstraints, source.dropPrimaryUniqueCheckConstraints, comment);
   appendPhase(target.alterColumns, source.alterColumns, comment);
@@ -1005,13 +1069,18 @@ function formatMigrationPlanPhases(phases: MigrationPlanPhases, wrapTransaction:
 
 function getMigrationPlanStatements(phases: MigrationPlanPhases): string[] {
   return [
-    ...withPhaseHeader('1. Drop foreign keys', phases.dropForeignKeys),
-    ...withPhaseHeader('2. Drop primary/unique/check constraints', phases.dropPrimaryUniqueCheckConstraints),
-    ...withPhaseHeader('3. Drop/alter/add columns', phases.alterColumns),
-    ...withPhaseHeader('4. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
-    ...withPhaseHeader('5. Add foreign keys', phases.addForeignKeys),
+    ...withPhaseHeader('1. Create schemas', uniqueStatements(phases.createSchemas)),
+    ...withPhaseHeader('2. Drop foreign keys', phases.dropForeignKeys),
+    ...withPhaseHeader('3. Drop primary/unique/check constraints', phases.dropPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('4. Drop/alter/add columns', phases.alterColumns),
+    ...withPhaseHeader('5. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('6. Add foreign keys', phases.addForeignKeys),
     ...withPhaseHeader('Other object changes', phases.other)
   ];
+}
+
+function uniqueStatements(statements: readonly string[]): string[] {
+  return Array.from(new Set(statements));
 }
 
 function withPhaseHeader(header: string, statements: readonly string[]): string[] {
@@ -1560,7 +1629,7 @@ function formatUnknownError(error: unknown): string {
   return String(error);
 }
 
-function getEmptyDocumentFileName(ref: SchemaObjectRef, side: 'database' | 'local'): string {
+function getEmptyDocumentFileName(ref: SchemaComparisonRef, side: 'database' | 'local'): string {
   return `${ref.schema}.${ref.name}.empty-${side}.sql`;
 }
 

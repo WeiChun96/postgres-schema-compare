@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.1
+
+Patch update.
+
+- Add schema-level folder comparison so local schema folders missing from the live database appear as local-only differences.
+- Generate `CREATE SCHEMA IF NOT EXISTS` migration plan steps for missing schemas before object changes, without adding schema steps for schemas already present on both sides.
+- Update the folder comparison webview with status filters, filtered bulk actions, schema-specific actions, and clearer local-only schema handling.
+- Show local-only schemas in the Database Objects explorer with a visible local-only indication.
+- Ignore dot-prefixed local schema folders and SQL files, such as `.vscode`, during schema folder scans.
+- Tighten the folder comparison webview content security policy by nonce-protecting styles and scripts.
+- Bump the extension package version to `0.1.1`.
+
 ## v0.1.0
 
 Major update.

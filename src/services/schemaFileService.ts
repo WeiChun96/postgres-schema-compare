@@ -110,7 +110,7 @@ export class SchemaFileService {
     const schemaFolders = await this.tryReadDirectory(this.schemaRoot);
 
     for (const [schemaName, schemaFileType] of schemaFolders) {
-      if (schemaFileType !== vscode.FileType.Directory) {
+      if (schemaFileType !== vscode.FileType.Directory || isDotEntry(schemaName)) {
         continue;
       }
 
@@ -119,7 +119,7 @@ export class SchemaFileService {
         const files = await this.tryReadDirectory(folderUri);
 
         for (const [fileName, fileType] of files) {
-          if (fileType !== vscode.FileType.File || !fileName.toLowerCase().endsWith('.sql')) {
+          if (fileType !== vscode.FileType.File || isDotEntry(fileName) || !fileName.toLowerCase().endsWith('.sql')) {
             continue;
           }
 
@@ -133,7 +133,7 @@ export class SchemaFileService {
       const legacyFiles = await this.tryReadDirectory(legacyFolderUri);
 
       for (const [fileName, fileType] of legacyFiles) {
-        if (fileType !== vscode.FileType.File || !fileName.toLowerCase().endsWith('.sql')) {
+        if (fileType !== vscode.FileType.File || isDotEntry(fileName) || !fileName.toLowerCase().endsWith('.sql')) {
           continue;
         }
 
@@ -142,6 +142,30 @@ export class SchemaFileService {
     }
 
     return objects.sort((left, right) => objectKey(left).localeCompare(objectKey(right)));
+  }
+
+  public async listLocalSchemas(): Promise<string[]> {
+    if (!this.schemaFolderName) {
+      throw new Error('Configure a schema folder before comparing local SQL files.');
+    }
+
+    const schemas = new Set<string>();
+    const schemaFolders = await this.tryReadDirectory(this.schemaRoot);
+
+    for (const [schemaName, schemaFileType] of schemaFolders) {
+      if (schemaFileType !== vscode.FileType.Directory || isDotEntry(schemaName)) {
+        continue;
+      }
+
+      if (schemaObjectKindByFolder.has(schemaName.toLowerCase())) {
+        schemas.add(this.defaultSchema);
+        continue;
+      }
+
+      schemas.add(schemaName);
+    }
+
+    return Array.from(schemas).sort((left, right) => left.localeCompare(right));
   }
 
   public async writeLocalDefinition(definition: SchemaObjectDefinition): Promise<vscode.Uri> {
@@ -196,6 +220,10 @@ function sanitizeFileSegment(value: string): string {
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function isDotEntry(value: string): boolean {
+  return value.startsWith('.');
 }
 
 function formatSupportedFolders(): string {
