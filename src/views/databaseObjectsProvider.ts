@@ -64,7 +64,7 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
       case 'schema':
         return createSchemaItem(node);
       case 'folder':
-        return createFolderItem(node.kind, node.isComparisonLoaded, node.comparisonCounts);
+        return createFolderItem(node.schema, node.kind, node.isComparisonLoaded, node.comparisonCounts);
       case 'object':
         return createObjectItem(node);
       case 'failed':
@@ -120,11 +120,13 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
       return;
     }
 
-    await Promise.all(
-      Array.from(this.folderNodes.keys())
-        .filter((key) => key.endsWith(`:${kind}`))
-        .map((key) => this.refreshFolder(key.slice(0, -kind.length - 1), kind))
-    );
+    const schemas = Array.from(this.folderNodes.keys())
+      .filter((key) => key.endsWith(`:${kind}`))
+      .map((key) => key.slice(0, -kind.length - 1));
+
+    for (const schema of schemas) {
+      await this.refreshFolder(schema, kind);
+    }
   }
 
   public async refreshObject(ref: SchemaObjectRef): Promise<void> {
@@ -561,20 +563,14 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
   }
 
   private fireChangedFolder(schema: string, kind: SchemaObjectKind): void {
-    const folderKey = getFolderKey(schema, kind);
-    const hadFolderNode = this.folderNodes.has(folderKey);
-    const folderNode = hadFolderNode ? this.getFolderNode(schema, kind) : undefined;
-
-    if (folderNode) {
-      this.changeEmitter.fire(folderNode);
-      return;
-    }
-
     const schemaNode = this.schemaNodes.get(schema);
 
     if (schemaNode) {
       this.changeEmitter.fire(schemaNode);
+      return;
     }
+
+    this.changeEmitter.fire(undefined);
   }
 }
 
@@ -609,11 +605,13 @@ function createSchemaItem(node: Extract<DatabaseTreeNode, { type: 'schema' }>): 
 }
 
 function createFolderItem(
+  schema: string,
   kind: SchemaObjectKind,
   isComparisonLoaded: boolean,
   counts: FolderComparisonCounts | undefined
 ): vscode.TreeItem {
   const item = new vscode.TreeItem(schemaObjectFolderByKind[kind], vscode.TreeItemCollapsibleState.Collapsed);
+  item.id = `folder:${schema}:${kind}`;
   item.description = isComparisonLoaded && counts
     ? `${counts.noDiff} no diff / ${counts.diff} diff`
     : 'not loaded';

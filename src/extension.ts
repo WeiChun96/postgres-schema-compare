@@ -82,7 +82,7 @@ function registerRefreshObjectKindFromDatabaseCommand(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'postgresSchemaCompare.refreshObjectKindFromDatabase',
-      async (input?: SchemaObjectKind | { readonly kind?: SchemaObjectKind }) => {
+      async (input?: SchemaObjectKind | { readonly kind?: SchemaObjectKind; readonly schema?: string }) => {
         try {
           const kind = resolveSchemaObjectKind(input);
 
@@ -93,10 +93,12 @@ function registerRefreshObjectKindFromDatabaseCommand(
           await vscode.window.withProgress(
             {
               location: vscode.ProgressLocation.Notification,
-              title: `Refreshing ${schemaObjectFolderByKind[kind].toLowerCase()} from live database...`,
+              title: `Refreshing ${schemaObjectFolderByKind[kind].toLowerCase()}${typeof input === 'object' && input.schema ? ` in ${input.schema}` : ''} from live database...`,
               cancellable: false
             },
-            () => databaseObjectsProvider.refreshKind(kind)
+            () => typeof input === 'object' && input.schema
+              ? databaseObjectsProvider.refreshFolder(input.schema, kind)
+              : databaseObjectsProvider.refreshKind(kind)
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -107,7 +109,9 @@ function registerRefreshObjectKindFromDatabaseCommand(
   );
 }
 
-function resolveSchemaObjectKind(input: SchemaObjectKind | { readonly kind?: SchemaObjectKind } | undefined): SchemaObjectKind | undefined {
+function resolveSchemaObjectKind(
+  input: SchemaObjectKind | { readonly kind?: SchemaObjectKind; readonly schema?: string } | undefined
+): SchemaObjectKind | undefined {
   if (typeof input === 'string' && schemaObjectKinds.includes(input)) {
     return input;
   }

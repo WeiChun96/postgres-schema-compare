@@ -15,6 +15,7 @@ type BulkComparisonMessage = {
   readonly type: 'bulkUpdateFolder' | 'bulkMigrationPlan' | 'bulkUpdateDatabase';
   readonly status?: FilterableComparisonStatus;
   readonly schema?: string;
+  readonly kind?: SchemaComparisonRef['kind'];
 };
 
 type ComparisonMessage = RowComparisonMessage | BulkComparisonMessage;
@@ -50,17 +51,17 @@ export function registerCompareFolderWithDatabaseCommand(
           async (message: ComparisonMessage) => {
             try {
               if (message.type === 'bulkUpdateFolder') {
-                await updateAllFolderDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema);
+                await updateAllFolderDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema, message.kind);
                 return;
               }
 
               if (message.type === 'bulkMigrationPlan') {
-                await openAllDatabaseMigrationPlan(diffService, resultById, message.status, message.schema);
+                await openAllDatabaseMigrationPlan(diffService, resultById, message.status, message.schema, message.kind);
                 return;
               }
 
               if (message.type === 'bulkUpdateDatabase') {
-                await updateAllDatabaseDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema);
+                await updateAllDatabaseDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema, message.kind);
                 return;
               }
 
@@ -283,6 +284,7 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
   const hasResults = results.length > 0;
   const bulkActionOptions = getBulkActionOptions(results);
   const schemas = Array.from(new Set(results.map((result) => result.ref.schema))).sort((left, right) => left.localeCompare(right));
+  const kinds = Array.from(new Set(results.map((result) => result.ref.kind))).sort((left, right) => getTypeLabel(left).localeCompare(getTypeLabel(right)));
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -368,6 +370,22 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
+    }
+
+    .filter-selects {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .select-filter {
+      display: grid;
+      gap: 4px;
+    }
+
+    .select-filter label {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
     }
 
     .filter-button {
@@ -585,10 +603,23 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
         <div class="toolbar">
           <div class="filter-group" aria-label="Filter differences">
             <div class="filter-label">Filter changes</div>
-            <select data-schema-filter aria-label="Filter by schema">
-              <option value="">All schemas</option>
-              ${schemas.map((schema) => `<option value="${escapeAttribute(schema)}">${escapeHtml(schema)}</option>`).join('')}
-            </select>
+            <div class="filter-selects">
+              <div class="select-filter">
+                <label for="schema-filter">Schema</label>
+                <select id="schema-filter" data-schema-filter>
+                  <option value="">All schemas</option>
+                  ${schemas.map((schema) => `<option value="${escapeAttribute(schema)}">${escapeHtml(schema)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="select-filter">
+                <label for="type-filter">Type</label>
+                <select id="type-filter" data-type-filter>
+                  <option value="">All types</option>
+                  ${kinds.map((kind) => `<option value="${escapeAttribute(kind)}">${escapeHtml(getTypeLabel(kind))}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+            <div class="filter-label">Status</div>
             <div class="filters">
               ${renderStatusFilterButton('modified', counts.modified)}
               ${renderStatusFilterButton('missingLocal', counts.missingLocal)}
@@ -597,7 +628,7 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
             <div id="filter-status" class="filter-status" role="status" aria-live="polite">${results.length} change(s) shown.</div>
           </div>
           <div class="bulk-actions">
-            <div class="bulk-label">Bulk action</div>
+            <div class="bulk-label">Bulk action — shown changes only</div>
             <div class="bulk-controls">
               <select data-bulk-action-select${bulkActionOptions.length === 0 ? ' disabled' : ''} aria-label="Bulk action">
                 ${renderBulkActionOptions(results)}
@@ -628,8 +659,10 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    let activeFilter = undefined;
-    let activeSchema = undefined;
+    const savedFilterState = vscode.getState() || {};
+    let activeFilter = savedFilterState.status;
+    let activeSchema = savedFilterState.schema;
+    let activeKind = savedFilterState.kind;
 
     function getVisibleRows() {
       return Array.from(document.querySelectorAll('tbody tr[data-id]')).filter((row) => !row.hidden);
@@ -660,6 +693,9 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
       if (activeSchema) {
         scopes.push('in ' + activeSchema);
       }
+      if (activeKind) {
+        scopes.push('of type ' + getTypeLabel(activeKind));
+      }
       if (activeFilter) {
         scopes.push('with status ' + getFilterLabel(activeFilter).toLowerCase());
       }
@@ -679,9 +715,18 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
       }
     }
 
-    function applyFilter(nextFilter) {
+    function getTypeLabel(kind) {
+      const option = document.querySelector('select[data-type-filter] option[value="' + CSS.escape(kind) + '"]');
+      return option ? option.textContent : kind;
+    }
+
+    function applyStatusFilter(nextFilter) {
       activeFilter = activeFilter === nextFilter ? undefined : nextFilter;
 
+      applyFilters();
+    }
+
+    function applyFilters() {
       document.querySelectorAll('button[data-filter-status]').forEach((button) => {
         button.setAttribute('aria-pressed', String(button.dataset.filterStatus === activeFilter));
       });
@@ -691,6 +736,7 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
         row.hidden = Boolean(
           (activeFilter && row.dataset.status !== activeFilter)
           || (activeSchema && row.dataset.schema !== activeSchema)
+          || (activeKind && row.dataset.kind !== activeKind)
         );
       }
 
@@ -701,6 +747,11 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
 
       updateFilterStatus();
       updateBulkActionState();
+      vscode.setState({
+        status: activeFilter,
+        schema: activeSchema,
+        kind: activeKind
+      });
     }
 
     document.addEventListener('click', (event) => {
@@ -710,7 +761,7 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
 
       const filterButton = event.target.closest('button[data-filter-status]');
       if (filterButton && !filterButton.disabled) {
-        applyFilter(filterButton.dataset.filterStatus);
+        applyStatusFilter(filterButton.dataset.filterStatus);
         return;
       }
 
@@ -724,7 +775,8 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
         vscode.postMessage({
           type: select.value,
           status: activeFilter,
-          schema: activeSchema
+          schema: activeSchema,
+          kind: activeKind
         });
         return;
       }
@@ -748,13 +800,29 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
 
     document.querySelector('select[data-schema-filter]')?.addEventListener('change', (event) => {
       activeSchema = event.target.value || undefined;
-      const currentStatusFilter = activeFilter;
-      activeFilter = undefined;
-      applyFilter(currentStatusFilter);
+      applyFilters();
     });
 
-    updateFilterStatus();
-    updateBulkActionState();
+    document.querySelector('select[data-type-filter]')?.addEventListener('change', (event) => {
+      activeKind = event.target.value || undefined;
+      applyFilters();
+    });
+
+    const schemaFilter = document.querySelector('select[data-schema-filter]');
+    if (schemaFilter && activeSchema && schemaFilter.querySelector('option[value="' + CSS.escape(activeSchema) + '"]')) {
+      schemaFilter.value = activeSchema;
+    } else {
+      activeSchema = undefined;
+    }
+
+    const typeFilter = document.querySelector('select[data-type-filter]');
+    if (typeFilter && activeKind && typeFilter.querySelector('option[value="' + CSS.escape(activeKind) + '"]')) {
+      typeFilter.value = activeKind;
+    } else {
+      activeKind = undefined;
+    }
+
+    applyFilters();
   </script>
 </body>
 </html>`;
@@ -766,7 +834,7 @@ function renderResultRow(result: SchemaComparisonResult): string {
   const signature = !isSchemaRef(result.ref) && result.ref.identityArguments ? `(${result.ref.identityArguments})` : '';
   const objectLabel = isSchemaRef(result.ref) ? result.ref.schema : `${result.ref.schema}.${result.ref.name}${signature}`;
 
-  return `<tr class="${escapeAttribute(result.status)}" data-id="${escapeAttribute(id)}" data-status="${escapeAttribute(result.status)}" data-schema="${escapeAttribute(result.ref.schema)}">
+  return `<tr class="${escapeAttribute(result.status)}" data-id="${escapeAttribute(id)}" data-status="${escapeAttribute(result.status)}" data-schema="${escapeAttribute(result.ref.schema)}" data-kind="${escapeAttribute(result.ref.kind)}">
     <td><span class="badge ${escapeAttribute(result.status)}">${escapeHtml(getStatusLabel(result.status))}</span></td>
     <td class="object">${escapeHtml(objectLabel)}</td>
     <td class="kind">${escapeHtml(result.ref.kind)}</td>
@@ -927,9 +995,10 @@ async function updateAllFolderDifferences(
   resultById: Map<string, SchemaComparisonResult>,
   onSynced: (ref: SchemaObjectRef) => Promise<void> | void,
   status?: FilterableComparisonStatus,
-  schema?: string
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
 ): Promise<void> {
-  const results = getActionableResults(resultById, status, schema);
+  const results = getActionableResults(resultById, status, schema, kind);
   const syncedRefs: SchemaObjectRef[] = [];
 
   for (const result of results) {
@@ -955,9 +1024,10 @@ async function updateAllDatabaseDifferences(
   resultById: Map<string, SchemaComparisonResult>,
   onSynced: (ref: SchemaObjectRef) => Promise<void> | void,
   status?: FilterableComparisonStatus,
-  schema?: string
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
 ): Promise<void> {
-  const results = getActionableResults(resultById, status, schema);
+  const results = getActionableResults(resultById, status, schema, kind);
   const syncedRefs: SchemaObjectRef[] = [];
 
   for (const result of results) {
@@ -967,7 +1037,7 @@ async function updateAllDatabaseDifferences(
   }
 
   const confirmed = await confirmAction(
-    `Apply the generated migration plan for ${getBulkScopeLabel(status, schema)}${results.length} difference(s) to the live database?`,
+    `Apply the generated migration plan for ${getBulkScopeLabel(status, schema, kind)}${results.length} difference(s) to the live database?`,
     'Update Database'
   );
 
@@ -988,12 +1058,14 @@ async function updateAllDatabaseDifferences(
 function getActionableResults(
   resultById: ReadonlyMap<string, SchemaComparisonResult>,
   status?: FilterableComparisonStatus,
-  schema?: string
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
 ): SchemaComparisonResult[] {
   return Array.from(resultById.values()).filter((result) =>
     result.status !== 'error'
     && (!status || result.status === status)
     && (!schema || result.ref.schema === schema)
+    && (!kind || result.ref.kind === kind)
   );
 }
 
@@ -1032,11 +1104,12 @@ async function openAllDatabaseMigrationPlan(
   diffService: SchemaDiffService,
   resultById: ReadonlyMap<string, SchemaComparisonResult>,
   status?: FilterableComparisonStatus,
-  schema?: string
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
 ): Promise<void> {
-  const results = getActionableResults(resultById, status, schema);
+  const results = getActionableResults(resultById, status, schema, kind);
   const uri = await runActionWithProgress(
-    `Preparing ${getBulkScopeLabel(status, schema).trim() || 'full'} database migration plan...`,
+    `Preparing ${getBulkScopeLabel(status, schema, kind).trim() || 'full'} database migration plan...`,
     () => diffService.prepareDatabaseMigrationPlanForResults(results)
   );
 
@@ -1099,10 +1172,43 @@ function getStatusLabel(status: SchemaComparisonStatus): string {
   }
 }
 
-function getBulkScopeLabel(status: FilterableComparisonStatus | undefined, schema?: string): string {
-  const parts = [schema ? `schema ${schema}` : undefined, status ? getStatusLabel(status).toLowerCase() : undefined]
+function getBulkScopeLabel(
+  status: FilterableComparisonStatus | undefined,
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
+): string {
+  const parts = [
+    schema ? `schema ${schema}` : undefined,
+    kind ? `type ${getTypeLabel(kind)}` : undefined,
+    status ? getStatusLabel(status).toLowerCase() : undefined
+  ]
     .filter((part): part is string => Boolean(part));
   return parts.length > 0 ? `${parts.join(', ')} ` : '';
+}
+
+function getTypeLabel(kind: SchemaComparisonRef['kind']): string {
+  switch (kind) {
+    case 'schema':
+      return 'Schema';
+    case 'table':
+      return 'Table';
+    case 'view':
+      return 'View';
+    case 'materializedView':
+      return 'Materialized View';
+    case 'index':
+      return 'Index';
+    case 'function':
+      return 'Function';
+    case 'procedure':
+      return 'Procedure';
+    case 'sequence':
+      return 'Sequence';
+    case 'trigger':
+      return 'Trigger';
+    case 'type':
+      return 'Type';
+  }
 }
 
 function getStatusDetail(status: SchemaComparisonStatus): string {

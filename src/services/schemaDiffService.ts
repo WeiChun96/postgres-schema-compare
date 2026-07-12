@@ -286,7 +286,7 @@ export class SchemaDiffService {
       return;
     }
 
-    await this.postgresSchemaService.executeSql(sql);
+    await this.postgresSchemaService.executeSql(ensureRoutineTerminator(ref, sql));
   }
 
   public async prepareDatabaseMigrationPlan(result: SchemaComparisonResult): Promise<vscode.Uri> {
@@ -320,7 +320,7 @@ export class SchemaDiffService {
       return;
     }
 
-    await this.postgresSchemaService.executeSql(sql);
+    await this.postgresSchemaService.executeSql(ensureRoutineTerminator(ref, sql));
   }
 
   public async dropDatabaseObject(ref: SchemaObjectRef): Promise<void> {
@@ -374,7 +374,7 @@ export class SchemaDiffService {
     }
 
     return createMigrationPlanPhases({
-      other: [sql.trim()]
+      other: [ensureRoutineTerminator(result.ref, sql).trim()]
     });
   }
 
@@ -1179,13 +1179,20 @@ function getConstraintKind(definition: string): ParsedConstraintKind {
 }
 
 function stripTransactionWrapper(sql: string): string {
-  const lines = sql
+  return sql
     .trim()
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => !/^BEGIN;?$/i.test(line) && !/^COMMIT;?$/i.test(line));
+    .replace(/^BEGIN\s*;\s*/i, '')
+    .replace(/\s*COMMIT\s*;\s*$/i, '')
+    .trim();
+}
 
-  return lines.join('\n');
+function ensureRoutineTerminator(ref: SchemaObjectRef, sql: string): string {
+  if (ref.kind !== 'function' && ref.kind !== 'procedure') {
+    return sql;
+  }
+
+  const trimmed = sql.trimEnd();
+  return trimmed.endsWith(';') ? trimmed : `${trimmed};`;
 }
 
 function parseCreateTableDefinition(sql: string): ParsedTableDefinition {

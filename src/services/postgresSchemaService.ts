@@ -29,14 +29,16 @@ export class PostgresSchemaService {
   }
 
   public getSqlReplacingObject(ref: SchemaObjectRef, sql: string): string {
+    const executableSql = ensureRoutineTerminator(ref, sql);
+
     if ((ref.kind === 'function' || ref.kind === 'procedure') && !ref.identityArguments) {
-      return ensureTrailingNewline(sql);
+      return ensureTrailingNewline(executableSql);
     }
 
     return ensureTrailingNewline([
       'BEGIN;',
       getDropStatement(ref),
-      sql.trim(),
+      executableSql.trim(),
       'COMMIT;'
     ].join('\n\n'));
   }
@@ -342,7 +344,7 @@ export class PostgresSchemaService {
       );
     }
 
-    return result.rows[0].ddl;
+    return ensureStatementTerminator(result.rows[0].ddl);
   }
 
   private async queryProcedureDefinition(client: Client, ref: SchemaObjectRef): Promise<string> {
@@ -370,7 +372,7 @@ export class PostgresSchemaService {
       );
     }
 
-    return result.rows[0].ddl;
+    return ensureStatementTerminator(result.rows[0].ddl);
   }
 
   private async queryViewDefinition(client: Client, ref: SchemaObjectRef): Promise<string> {
@@ -623,6 +625,17 @@ function formatQualifiedName(ref: SchemaObjectRef): string {
 
 function ensureTrailingNewline(value: string): string {
   return value.endsWith('\n') ? value : `${value}\n`;
+}
+
+function ensureStatementTerminator(sql: string): string {
+  const trimmed = sql.trimEnd();
+  return trimmed.endsWith(';') ? trimmed : `${trimmed};`;
+}
+
+function ensureRoutineTerminator(ref: SchemaObjectRef, sql: string): string {
+  return ref.kind === 'function' || ref.kind === 'procedure'
+    ? ensureStatementTerminator(sql)
+    : sql;
 }
 
 function getDropStatement(ref: SchemaObjectRef): string {
