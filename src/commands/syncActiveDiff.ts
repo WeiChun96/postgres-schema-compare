@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { SchemaObjectRef } from '../model/schemaObject';
 import { DiffSession, DiffSessionState } from '../services/diffSessionState';
 import { ServiceFactory } from '../services/serviceFactory';
 
@@ -6,7 +7,7 @@ export function registerSyncActiveDiffCommands(
   context: vscode.ExtensionContext,
   serviceFactory: ServiceFactory,
   diffSessionState: DiffSessionState,
-  onSynced: () => void
+  onSynced: (ref?: SchemaObjectRef) => Promise<void> | void
 ): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('postgresSchemaCompare.updateFolderFromDatabase', async () => {
@@ -27,7 +28,7 @@ export function registerSyncActiveDiffCommands(
 
             const uri = await diffService.deleteLocalObject(session.ref);
             await vscode.window.showInformationMessage(`Deleted local file: ${uri.fsPath}`);
-            onSynced();
+            await onSynced(session.ref);
             return;
           }
 
@@ -74,7 +75,7 @@ export function registerSyncActiveDiffCommands(
           }
         }
 
-        onSynced();
+        await onSynced(session.type === 'object' ? session.ref : undefined);
       });
     }),
     vscode.commands.registerCommand('postgresSchemaCompare.updateDatabaseFromFolder', async () => {
@@ -95,7 +96,7 @@ export function registerSyncActiveDiffCommands(
 
             await diffService.dropDatabaseObject(session.ref);
             await vscode.window.showInformationMessage(`Dropped live database object: ${session.ref.schema}.${session.ref.name}`);
-            onSynced();
+            await onSynced(session.ref);
             return;
           }
 
@@ -139,7 +140,7 @@ export function registerSyncActiveDiffCommands(
           await vscode.window.showInformationMessage('Updated live database from local SQL file.');
         }
 
-        onSynced();
+        await onSynced(session.type === 'object' ? session.ref : undefined);
       });
     })
   );

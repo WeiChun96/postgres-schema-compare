@@ -10,7 +10,7 @@ import { registerSyncActiveDiffCommands } from './commands/syncActiveDiff';
 import { hasConnectionConfig } from './config';
 import { schemaObjectFolderByKind, schemaObjectKinds, SchemaObjectKind } from './model/schemaObject';
 import { DiffSessionState } from './services/diffSessionState';
-import { LiveSchemaDocumentProvider } from './services/schemaDiffService';
+import { isSchemaRef, LiveSchemaDocumentProvider } from './services/schemaDiffService';
 import { ServiceFactory } from './services/serviceFactory';
 import { DatabaseObjectsProvider } from './views/databaseObjectsProvider';
 
@@ -42,8 +42,33 @@ export function activate(context: vscode.ExtensionContext): void {
   registerOpenConnectionSettingsCommand(context);
   registerCompareFileWithDatabaseCommand(context, serviceFactory, diffSessionState);
   registerSwapDiffDirectionCommand(context, serviceFactory, diffSessionState);
-  registerSyncActiveDiffCommands(context, serviceFactory, diffSessionState, () => databaseObjectsProvider.refresh());
-  registerCompareFolderWithDatabaseCommand(context, serviceFactory, diffSessionState, (kind) => databaseObjectsProvider.refreshKind(kind));
+  registerSyncActiveDiffCommands(
+    context,
+    serviceFactory,
+    diffSessionState,
+    (ref) => ref ? databaseObjectsProvider.refreshObject(ref) : databaseObjectsProvider.refresh()
+  );
+  registerCompareFolderWithDatabaseCommand(context, serviceFactory, diffSessionState, async (refs) => {
+    if (refs.some(isSchemaRef)) {
+      databaseObjectsProvider.refresh();
+      return;
+    }
+
+    const refreshedFolders = new Set<string>();
+    for (const ref of refs) {
+      if (isSchemaRef(ref)) {
+        continue;
+      }
+
+      const key = `${ref.schema}:${ref.kind}`;
+      if (refreshedFolders.has(key)) {
+        continue;
+      }
+
+      refreshedFolders.add(key);
+      await databaseObjectsProvider.refreshFolder(ref.schema, ref.kind);
+    }
+  });
   registerCompareDatabaseObjectWithFolderCommand(context, serviceFactory, diffSessionState);
   registerExportDatabaseToFolderCommand(context, serviceFactory, () => databaseObjectsProvider.refresh(), outputChannel);
   registerRevealObjectInExplorerCommand(context, serviceFactory);
@@ -77,7 +102,7 @@ function registerRefreshObjectKindFromDatabaseCommand(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'postgresSchemaCompare.refreshObjectKindFromDatabase',
-      async (input?: SchemaObjectKind | { readonly kind?: SchemaObjectKind }) => {
+      async (input?: SchemaObjectKind | { readonly kind?: SchemaObjectKind; readonly schema?: string }) => {
         try {
           const kind = resolveSchemaObjectKind(input);
 
@@ -88,10 +113,12 @@ function registerRefreshObjectKindFromDatabaseCommand(
           await vscode.window.withProgress(
             {
               location: vscode.ProgressLocation.Notification,
-              title: `Refreshing ${schemaObjectFolderByKind[kind].toLowerCase()} from live database...`,
+              title: `Refreshing ${schemaObjectFolderByKind[kind].toLowerCase()}${typeof input === 'object' && input.schema ? ` in ${input.schema}` : ''} from live database...`,
               cancellable: false
             },
-            () => databaseObjectsProvider.refreshKind(kind)
+            () => typeof input === 'object' && input.schema
+              ? databaseObjectsProvider.refreshFolder(input.schema, kind)
+              : databaseObjectsProvider.refreshKind(kind)
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -102,7 +129,9 @@ function registerRefreshObjectKindFromDatabaseCommand(
   );
 }
 
-function resolveSchemaObjectKind(input: SchemaObjectKind | { readonly kind?: SchemaObjectKind } | undefined): SchemaObjectKind | undefined {
+function resolveSchemaObjectKind(
+  input: SchemaObjectKind | { readonly kind?: SchemaObjectKind; readonly schema?: string } | undefined
+): SchemaObjectKind | undefined {
   if (typeof input === 'string' && schemaObjectKinds.includes(input)) {
     return input;
   }

@@ -1,9 +1,10 @@
 import * as vscode from 'vscode';
-import { SchemaObjectRef } from '../model/schemaObject';
 import { DiffSessionState } from '../services/diffSessionState';
-import { SchemaComparisonResult, SchemaComparisonStatus, SchemaDiffService } from '../services/schemaDiffService';
+import { isSchemaRef, SchemaComparisonRef, SchemaComparisonResult, SchemaComparisonStatus, SchemaDiffService } from '../services/schemaDiffService';
 import { ServiceFactory } from '../services/serviceFactory';
-import { SchemaObjectKind } from '../model/schemaObject';
+import { SchemaObjectRef } from '../model/schemaObject';
+
+type FilterableComparisonStatus = Extract<SchemaComparisonStatus, 'modified' | 'missingLocal' | 'localOnly'>;
 
 type RowComparisonMessage = {
   readonly type: 'openDiff' | 'updateFolder' | 'updateDatabase' | 'showMigrationPlan';
@@ -12,6 +13,9 @@ type RowComparisonMessage = {
 
 type BulkComparisonMessage = {
   readonly type: 'bulkUpdateFolder' | 'bulkMigrationPlan' | 'bulkUpdateDatabase';
+  readonly status?: FilterableComparisonStatus;
+  readonly schema?: string;
+  readonly kind?: SchemaComparisonRef['kind'];
 };
 
 type ComparisonMessage = RowComparisonMessage | BulkComparisonMessage;
@@ -24,7 +28,7 @@ export function registerCompareFolderWithDatabaseCommand(
   context: vscode.ExtensionContext,
   serviceFactory: ServiceFactory,
   diffSessionState: DiffSessionState,
-  onSynced: (kind: SchemaObjectKind) => Promise<void> | void
+  onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void
 ): void {
   const disposable = vscode.commands.registerCommand(
     'postgresSchemaCompare.compareFolderWithDatabase',
@@ -41,23 +45,23 @@ export function registerCompareFolderWithDatabaseCommand(
           }
         );
 
-        panel.webview.html = renderLoadingHtml(panel.webview);
+        panel.webview.html = renderLoadingHtml();
 
         panel.webview.onDidReceiveMessage(
           async (message: ComparisonMessage) => {
             try {
               if (message.type === 'bulkUpdateFolder') {
-                await updateAllFolderDifferences(panel.webview, diffService, resultById, onSynced);
+                await updateAllFolderDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema, message.kind);
                 return;
               }
 
               if (message.type === 'bulkMigrationPlan') {
-                await openAllDatabaseMigrationPlan(diffService, resultById);
+                await openAllDatabaseMigrationPlan(diffService, resultById, message.status, message.schema, message.kind);
                 return;
               }
 
               if (message.type === 'bulkUpdateDatabase') {
-                await updateAllDatabaseDifferences(panel.webview, diffService, resultById, onSynced);
+                await updateAllDatabaseDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema, message.kind);
                 return;
               }
 
@@ -73,8 +77,8 @@ export function registerCompareFolderWithDatabaseCommand(
               if (message.type === 'updateFolder') {
                 const didSync = await updateFolderFromResult(diffService, result);
 
-                if (didSync) {
-                  await refreshComparisonView(panel.webview, diffService, resultById, result.ref.kind, onSynced);
+                if (didSync && !isSchemaRef(result.ref)) {
+                  await refreshComparisonView(panel.webview, resultById, [result.ref], onSynced);
                 }
 
                 return;
@@ -84,7 +88,7 @@ export function registerCompareFolderWithDatabaseCommand(
                 const didSync = await updateDatabaseFromResult(diffService, result);
 
                 if (didSync) {
-                  await refreshComparisonView(panel.webview, diffService, resultById, result.ref.kind, onSynced);
+                  await refreshComparisonView(panel.webview, resultById, [result.ref], onSynced);
                 }
 
                 return;
@@ -96,13 +100,15 @@ export function registerCompareFolderWithDatabaseCommand(
               }
 
               const preparedDiff = await diffService.prepareComparisonDiff(result);
-              diffSessionState.setLastDiff({
-                type: 'object',
-                ref: result.ref,
-                direction: 'databaseToLocal',
-                status: result.status
-              });
-              await vscode.commands.executeCommand('setContext', 'postgresSchemaCompare.hasActiveDiff', true);
+              if (!isSchemaRef(result.ref)) {
+                diffSessionState.setLastDiff({
+                  type: 'object',
+                  ref: result.ref,
+                  direction: 'databaseToLocal',
+                  status: result.status
+                });
+                await vscode.commands.executeCommand('setContext', 'postgresSchemaCompare.hasActiveDiff', true);
+              }
               await vscode.commands.executeCommand(
                 'vscode.diff',
                 preparedDiff.leftUri,
@@ -127,10 +133,10 @@ export function registerCompareFolderWithDatabaseCommand(
             resultById.set(getResultId(result.ref), result);
           }
 
-          panel.webview.html = renderComparisonHtml(panel.webview, changedResults);
+          panel.webview.html = renderComparisonHtml(changedResults);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          panel.webview.html = renderErrorHtml(panel.webview, message);
+          panel.webview.html = renderErrorHtml(message);
           await vscode.window.showErrorMessage(`PostgreSQL Schema Compare: ${message}`);
         }
       } catch (error) {
@@ -143,7 +149,7 @@ export function registerCompareFolderWithDatabaseCommand(
   context.subscriptions.push(disposable);
 }
 
-function renderLoadingHtml(webview: vscode.Webview): string {
+function renderLoadingHtml(): string {
   const nonce = createNonce();
 
   return `<!DOCTYPE html>
@@ -151,9 +157,13 @@ function renderLoadingHtml(webview: vscode.Webview): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
   <title>Schema Folder vs Database</title>
-  <style>
+  <style nonce="${nonce}">
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       align-items: center;
       background: var(--vscode-editor-background);
@@ -210,7 +220,7 @@ function renderLoadingHtml(webview: vscode.Webview): string {
 </html>`;
 }
 
-function renderErrorHtml(webview: vscode.Webview, message: string): string {
+function renderErrorHtml(message: string): string {
   const nonce = createNonce();
 
   return `<!DOCTYPE html>
@@ -218,9 +228,13 @@ function renderErrorHtml(webview: vscode.Webview, message: string): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
   <title>Schema Folder vs Database</title>
-  <style>
+  <style nonce="${nonce}">
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       background: var(--vscode-editor-background);
       color: var(--vscode-foreground);
@@ -260,20 +274,27 @@ function renderErrorHtml(webview: vscode.Webview, message: string): string {
 </html>`;
 }
 
-function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaComparisonResult[]): string {
+function renderComparisonHtml(results: readonly SchemaComparisonResult[]): string {
   const nonce = createNonce();
   const counts = getStatusCounts(results);
   const rows = results.map(renderResultRow).join('');
   const hasResults = results.length > 0;
+  const bulkActionOptions = getBulkActionOptions(results);
+  const schemas = Array.from(new Set(results.map((result) => result.ref.schema))).sort((left, right) => left.localeCompare(right));
+  const kinds = Array.from(new Set(results.map((result) => result.ref.kind))).sort((left, right) => getTypeLabel(left).localeCompare(getTypeLabel(right)));
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
   <title>Schema Folder vs Database</title>
-  <style>
+  <style nonce="${nonce}">
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       background: var(--vscode-editor-background);
       color: var(--vscode-foreground);
@@ -296,7 +317,13 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
     h1 {
       font-size: 20px;
       font-weight: 600;
-      margin: 0 0 10px;
+      margin: 0 0 6px;
+    }
+
+    .subtitle {
+      color: var(--vscode-descriptionForeground);
+      line-height: 1.45;
+      margin-bottom: 14px;
     }
 
     .summary {
@@ -307,17 +334,92 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
     }
 
     .summary-bar {
-      align-items: center;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px 16px;
-      justify-content: space-between;
+      display: grid;
+      gap: 12px;
     }
 
     .count {
       border: 1px solid var(--vscode-panel-border);
       border-radius: 3px;
       padding: 3px 8px;
+    }
+
+    .toolbar {
+      align-items: end;
+      display: grid;
+      gap: 12px 16px;
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .filter-group {
+      display: grid;
+      gap: 7px;
+    }
+
+    .filter-label,
+    .bulk-label {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .filter-selects {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .select-filter {
+      display: grid;
+      gap: 4px;
+    }
+
+    .select-filter label {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+    }
+
+    .filter-button {
+      align-items: center;
+      background: transparent;
+      border: 1px solid var(--vscode-panel-border);
+      color: var(--vscode-foreground);
+      display: inline-flex;
+      gap: 7px;
+      justify-content: center;
+      min-height: 30px;
+      padding: 4px 9px;
+    }
+
+    .filter-button:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+
+    .filter-button[aria-pressed="true"] {
+      border-color: var(--vscode-focusBorder);
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
+
+    .filter-button[disabled] {
+      cursor: default;
+      opacity: 0.5;
+    }
+
+    .filter-count {
+      color: var(--vscode-descriptionForeground);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .filter-status {
+      color: var(--vscode-descriptionForeground);
+      min-height: 18px;
     }
 
     table {
@@ -403,6 +505,11 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
       background: var(--vscode-button-hoverBackground);
     }
 
+    button:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 2px;
+    }
+
     button[disabled] {
       cursor: default;
       opacity: 0.55;
@@ -425,9 +532,17 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
 
     .bulk-actions {
       align-items: center;
+      display: grid;
+      gap: 7px;
+      justify-items: end;
+    }
+
+    .bulk-controls {
+      align-items: center;
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
+      justify-content: flex-end;
     }
 
     .empty-state {
@@ -435,25 +550,89 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
       color: var(--vscode-descriptionForeground);
       padding: 28px;
     }
+
+    .filtered-empty-state {
+      border: 1px dashed var(--vscode-panel-border);
+      color: var(--vscode-descriptionForeground);
+      display: none;
+      margin-top: 12px;
+      padding: 18px;
+    }
+
+    .filtered-empty-state.visible {
+      display: block;
+    }
+
+    @media (max-width: 760px) {
+      body {
+        padding: 16px;
+      }
+
+      .toolbar {
+        grid-template-columns: 1fr;
+      }
+
+      .bulk-actions {
+        justify-items: stretch;
+      }
+
+      .bulk-controls {
+        justify-content: stretch;
+      }
+
+      .bulk-controls select,
+      .bulk-controls button {
+        flex: 1 1 180px;
+      }
+    }
   </style>
 </head>
 <body>
   <main>
     <header>
       <h1>Schema Folder vs Database</h1>
+      <div class="subtitle">Review differences between local SQL files and the live database.</div>
       <div class="summary-bar">
         <div class="summary">
           <span class="count" data-count="total">${results.length} change(s)</span>
-          <span class="count" data-count="modified">${counts.modified} modified</span>
-          <span class="count" data-count="missingLocal">${counts.missingLocal} missing local</span>
-          <span class="count" data-count="localOnly">${counts.localOnly} local only</span>
           <span class="count" data-count="error">${counts.error} error(s)</span>
         </div>
-        <div class="bulk-actions">
-          <select data-bulk-action-select${getBulkActionOptions(results).length === 0 ? ' disabled' : ''}>
-            ${renderBulkActionOptions(results)}
-          </select>
-          <button data-run-bulk-action${getBulkActionOptions(results).length === 0 ? ' disabled' : ''}>Run</button>
+        <div class="toolbar">
+          <div class="filter-group" aria-label="Filter differences">
+            <div class="filter-label">Filter changes</div>
+            <div class="filter-selects">
+              <div class="select-filter">
+                <label for="schema-filter">Schema</label>
+                <select id="schema-filter" data-schema-filter>
+                  <option value="">All schemas</option>
+                  ${schemas.map((schema) => `<option value="${escapeAttribute(schema)}">${escapeHtml(schema)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="select-filter">
+                <label for="type-filter">Type</label>
+                <select id="type-filter" data-type-filter>
+                  <option value="">All types</option>
+                  ${kinds.map((kind) => `<option value="${escapeAttribute(kind)}">${escapeHtml(getTypeLabel(kind))}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+            <div class="filter-label">Status</div>
+            <div class="filters">
+              ${renderStatusFilterButton('modified', counts.modified)}
+              ${renderStatusFilterButton('missingLocal', counts.missingLocal)}
+              ${renderStatusFilterButton('localOnly', counts.localOnly)}
+            </div>
+            <div id="filter-status" class="filter-status" role="status" aria-live="polite">${results.length} change(s) shown.</div>
+          </div>
+          <div class="bulk-actions">
+            <div class="bulk-label">Bulk action — shown changes only</div>
+            <div class="bulk-controls">
+              <select data-bulk-action-select${bulkActionOptions.length === 0 ? ' disabled' : ''} aria-label="Bulk action">
+                ${renderBulkActionOptions(results)}
+              </select>
+              <button data-run-bulk-action${bulkActionOptions.length === 0 ? ' disabled' : ''}>Run</button>
+            </div>
+          </div>
         </div>
       </div>
     </header>
@@ -471,14 +650,115 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
       <tbody>
         ${rows}
       </tbody>
-    </table>` : '<div class="empty-state">Schema folder matches the live database.</div>'}
+    </table>
+    <div id="filtered-empty-state" class="filtered-empty-state">No changes match the selected filter.</div>` : '<div class="empty-state">Schema folder matches the live database.</div>'}
   </main>
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+    const savedFilterState = vscode.getState() || {};
+    let activeFilter = savedFilterState.status;
+    let activeSchema = savedFilterState.schema;
+    let activeKind = savedFilterState.kind;
+
+    function getVisibleRows() {
+      return Array.from(document.querySelectorAll('tbody tr[data-id]')).filter((row) => !row.hidden);
+    }
+
+    function updateBulkActionState() {
+      const select = document.querySelector('select[data-bulk-action-select]');
+      const button = document.querySelector('button[data-run-bulk-action]');
+
+      if (!select || !button) {
+        return;
+      }
+
+      const hasVisibleActionableRows = getVisibleRows().some((row) => row.dataset.status !== 'error');
+      select.disabled = !hasVisibleActionableRows;
+      button.disabled = !hasVisibleActionableRows;
+    }
+
+    function updateFilterStatus() {
+      const filterStatus = document.getElementById('filter-status');
+
+      if (!filterStatus) {
+        return;
+      }
+
+      const visibleCount = getVisibleRows().length;
+      const scopes = [];
+      if (activeSchema) {
+        scopes.push('in ' + activeSchema);
+      }
+      if (activeKind) {
+        scopes.push('of type ' + getTypeLabel(activeKind));
+      }
+      if (activeFilter) {
+        scopes.push('with status ' + getFilterLabel(activeFilter).toLowerCase());
+      }
+      filterStatus.textContent = visibleCount + ' change(s) shown' + (scopes.length ? ' ' + scopes.join(' ') : '') + '.';
+    }
+
+    function getFilterLabel(status) {
+      switch (status) {
+        case 'modified':
+          return 'Modified';
+        case 'missingLocal':
+          return 'Missing Local';
+        case 'localOnly':
+          return 'Local Only';
+        default:
+          return 'All';
+      }
+    }
+
+    function getTypeLabel(kind) {
+      const option = document.querySelector('select[data-type-filter] option[value="' + CSS.escape(kind) + '"]');
+      return option ? option.textContent : kind;
+    }
+
+    function applyStatusFilter(nextFilter) {
+      activeFilter = activeFilter === nextFilter ? undefined : nextFilter;
+
+      applyFilters();
+    }
+
+    function applyFilters() {
+      document.querySelectorAll('button[data-filter-status]').forEach((button) => {
+        button.setAttribute('aria-pressed', String(button.dataset.filterStatus === activeFilter));
+      });
+
+      const rows = Array.from(document.querySelectorAll('tbody tr[data-id]'));
+      for (const row of rows) {
+        row.hidden = Boolean(
+          (activeFilter && row.dataset.status !== activeFilter)
+          || (activeSchema && row.dataset.schema !== activeSchema)
+          || (activeKind && row.dataset.kind !== activeKind)
+        );
+      }
+
+      const filteredEmptyState = document.getElementById('filtered-empty-state');
+      if (filteredEmptyState) {
+        filteredEmptyState.classList.toggle('visible', rows.length > 0 && getVisibleRows().length === 0);
+      }
+
+      updateFilterStatus();
+      updateBulkActionState();
+      vscode.setState({
+        status: activeFilter,
+        schema: activeSchema,
+        kind: activeKind
+      });
+    }
 
     document.addEventListener('click', (event) => {
       if (!(event.target instanceof Element)) {
+        return;
+      }
+
+      const filterButton = event.target.closest('button[data-filter-status]');
+      if (filterButton && !filterButton.disabled) {
+        applyStatusFilter(filterButton.dataset.filterStatus);
         return;
       }
 
@@ -490,7 +770,10 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
         }
 
         vscode.postMessage({
-          type: select.value
+          type: select.value,
+          status: activeFilter,
+          schema: activeSchema,
+          kind: activeKind
         });
         return;
       }
@@ -511,6 +794,32 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
         id: row.dataset.id
       });
     });
+
+    document.querySelector('select[data-schema-filter]')?.addEventListener('change', (event) => {
+      activeSchema = event.target.value || undefined;
+      applyFilters();
+    });
+
+    document.querySelector('select[data-type-filter]')?.addEventListener('change', (event) => {
+      activeKind = event.target.value || undefined;
+      applyFilters();
+    });
+
+    const schemaFilter = document.querySelector('select[data-schema-filter]');
+    if (schemaFilter && activeSchema && schemaFilter.querySelector('option[value="' + CSS.escape(activeSchema) + '"]')) {
+      schemaFilter.value = activeSchema;
+    } else {
+      activeSchema = undefined;
+    }
+
+    const typeFilter = document.querySelector('select[data-type-filter]');
+    if (typeFilter && activeKind && typeFilter.querySelector('option[value="' + CSS.escape(activeKind) + '"]')) {
+      typeFilter.value = activeKind;
+    } else {
+      activeKind = undefined;
+    }
+
+    applyFilters();
   </script>
 </body>
 </html>`;
@@ -519,11 +828,12 @@ function renderComparisonHtml(webview: vscode.Webview, results: readonly SchemaC
 function renderResultRow(result: SchemaComparisonResult): string {
   const id = getResultId(result.ref);
   const actionOptions = getActionOptions(result);
-  const signature = result.ref.identityArguments ? `(${result.ref.identityArguments})` : '';
+  const signature = !isSchemaRef(result.ref) && result.ref.identityArguments ? `(${result.ref.identityArguments})` : '';
+  const objectLabel = isSchemaRef(result.ref) ? result.ref.schema : `${result.ref.schema}.${result.ref.name}${signature}`;
 
-  return `<tr class="${escapeAttribute(result.status)}" data-id="${escapeAttribute(id)}">
+  return `<tr class="${escapeAttribute(result.status)}" data-id="${escapeAttribute(id)}" data-status="${escapeAttribute(result.status)}" data-schema="${escapeAttribute(result.ref.schema)}" data-kind="${escapeAttribute(result.ref.kind)}">
     <td><span class="badge ${escapeAttribute(result.status)}">${escapeHtml(getStatusLabel(result.status))}</span></td>
-    <td class="object">${escapeHtml(`${result.ref.schema}.${result.ref.name}${signature}`)}</td>
+    <td class="object">${escapeHtml(objectLabel)}</td>
     <td class="kind">${escapeHtml(result.ref.kind)}</td>
     <td class="detail">${escapeHtml(result.message ?? getStatusDetail(result.status))}</td>
     <td class="actions">
@@ -535,9 +845,24 @@ function renderResultRow(result: SchemaComparisonResult): string {
   </tr>`;
 }
 
+function renderStatusFilterButton(status: FilterableComparisonStatus, count: number): string {
+  return `<button class="filter-button ${escapeAttribute(status)}" type="button" data-filter-status="${escapeAttribute(status)}" aria-pressed="false">
+    <span>${escapeHtml(getStatusLabel(status))}</span>
+    <span class="filter-count">${count}</span>
+  </button>`;
+}
+
 function getActionOptions(result: SchemaComparisonResult): ReadonlyArray<{ readonly value: RowComparisonMessage['type']; readonly label: string }> {
   if (result.status === 'error') {
     return [];
+  }
+
+  if (isSchemaRef(result.ref)) {
+    return [
+      { value: 'openDiff', label: 'Compare' },
+      { value: 'showMigrationPlan', label: 'Create Schema Migration Plan' },
+      { value: 'updateDatabase', label: 'Create Schema in Database' }
+    ];
   }
 
   return [
@@ -580,9 +905,16 @@ async function updateFolderFromResult(
   diffService: SchemaDiffService,
   result: SchemaComparisonResult
 ): Promise<boolean> {
+  if (isSchemaRef(result.ref)) {
+    await vscode.window.showInformationMessage('Schema rows do not have a local SQL file to update.');
+    return false;
+  }
+
+  const objectRef = result.ref;
+
   if (result.status === 'localOnly') {
     const confirmed = await confirmAction(
-      `${result.ref.schema}.${result.ref.name} exists only in the folder. Delete the local file to match the live database?`,
+      `${objectRef.schema}.${objectRef.name} exists only in the folder. Delete the local file to match the live database?`,
       'Delete Local File'
     );
 
@@ -591,15 +923,15 @@ async function updateFolderFromResult(
     }
 
     await runActionWithProgress(
-      `Deleting local file for ${result.ref.schema}.${result.ref.name}...`,
-      () => diffService.deleteLocalObject(result.ref)
+      `Deleting local file for ${objectRef.schema}.${objectRef.name}...`,
+      () => diffService.deleteLocalObject(objectRef)
     );
     return true;
   }
 
   if (result.status === 'missingLocal') {
     const confirmed = await confirmAction(
-      `${result.ref.schema}.${result.ref.name} exists only in the live database. Create the local file to match the live database?`,
+      `${objectRef.schema}.${objectRef.name} exists only in the live database. Create the local file to match the live database?`,
       'Create Local File'
     );
 
@@ -609,8 +941,8 @@ async function updateFolderFromResult(
   }
 
   await runActionWithProgress(
-    `Updating folder from live database for ${result.ref.schema}.${result.ref.name}...`,
-    () => diffService.updateFolderFromDatabase(result.ref)
+    `Updating folder from live database for ${objectRef.schema}.${objectRef.name}...`,
+    () => diffService.updateFolderFromDatabase(objectRef)
   );
   return true;
 }
@@ -619,7 +951,9 @@ async function updateDatabaseFromResult(
   diffService: SchemaDiffService,
   result: SchemaComparisonResult
 ): Promise<boolean> {
-  const action = result.status === 'missingLocal' ? 'Drop Database Object' : 'Update Database';
+  const action = isSchemaRef(result.ref)
+    ? 'Create Schema'
+    : result.status === 'missingLocal' ? 'Drop Database Object' : 'Update Database';
   const message = getUpdateDatabaseConfirmationMessage(result);
   const confirmed = await confirmAction(message, action);
 
@@ -627,15 +961,25 @@ async function updateDatabaseFromResult(
     return false;
   }
 
+  if (isSchemaRef(result.ref)) {
+    await runActionWithProgress(
+      `Creating schema ${result.ref.schema} in live database...`,
+      () => diffService.updateDatabaseFromMigrationPlan([result])
+    );
+    return true;
+  }
+
+  const objectRef = result.ref;
+
   if (result.status === 'missingLocal') {
     await runActionWithProgress(
-      `Dropping live database object ${result.ref.schema}.${result.ref.name}...`,
-      () => diffService.dropDatabaseObject(result.ref)
+      `Dropping live database object ${objectRef.schema}.${objectRef.name}...`,
+      () => diffService.dropDatabaseObject(objectRef)
     );
   } else {
     await runActionWithProgress(
-      `Updating live database from folder for ${result.ref.schema}.${result.ref.name}...`,
-      () => diffService.updateDatabaseFromFolder(result.ref, result.status === 'modified')
+      `Updating live database from folder for ${objectRef.schema}.${objectRef.name}...`,
+      () => diffService.updateDatabaseFromFolder(objectRef, result.status === 'modified')
     );
   }
 
@@ -646,21 +990,28 @@ async function updateAllFolderDifferences(
   webview: vscode.Webview,
   diffService: SchemaDiffService,
   resultById: Map<string, SchemaComparisonResult>,
-  onSynced: (kind: SchemaObjectKind) => Promise<void> | void
+  onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void,
+  status?: FilterableComparisonStatus,
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
 ): Promise<void> {
-  const results = getActionableResults(resultById);
-  const syncedKinds = new Set<SchemaObjectKind>();
+  const results = getActionableResults(resultById, status, schema, kind);
+  const syncedRefs: SchemaObjectRef[] = [];
 
   for (const result of results) {
+    if (isSchemaRef(result.ref)) {
+      continue;
+    }
+
     const didSync = await updateFolderFromResult(diffService, result);
 
     if (didSync) {
-      syncedKinds.add(result.ref.kind);
+      syncedRefs.push(result.ref);
     }
   }
 
-  if (syncedKinds.size > 0) {
-    await refreshComparisonView(webview, diffService, resultById, Array.from(syncedKinds), onSynced);
+  if (syncedRefs.length > 0) {
+    await refreshComparisonView(webview, resultById, syncedRefs, onSynced);
   }
 }
 
@@ -668,17 +1019,16 @@ async function updateAllDatabaseDifferences(
   webview: vscode.Webview,
   diffService: SchemaDiffService,
   resultById: Map<string, SchemaComparisonResult>,
-  onSynced: (kind: SchemaObjectKind) => Promise<void> | void
+  onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void,
+  status?: FilterableComparisonStatus,
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
 ): Promise<void> {
-  const results = getActionableResults(resultById);
-  const syncedKinds = new Set<SchemaObjectKind>();
-
-  for (const result of results) {
-    syncedKinds.add(result.ref.kind);
-  }
+  const results = getActionableResults(resultById, status, schema, kind);
+  const syncedRefs = results.map((result) => result.ref);
 
   const confirmed = await confirmAction(
-    `Apply the full generated migration plan for ${results.length} difference(s) to the live database?`,
+    `Apply the generated migration plan for ${getBulkScopeLabel(status, schema, kind)}${results.length} difference(s) to the live database?`,
     'Update Database'
   );
 
@@ -691,16 +1041,28 @@ async function updateAllDatabaseDifferences(
     () => diffService.updateDatabaseFromMigrationPlan(results)
   );
 
-  if (syncedKinds.size > 0) {
-    await refreshComparisonView(webview, diffService, resultById, Array.from(syncedKinds), onSynced);
-  }
+  await refreshComparisonView(webview, resultById, syncedRefs, onSynced);
 }
 
-function getActionableResults(resultById: ReadonlyMap<string, SchemaComparisonResult>): SchemaComparisonResult[] {
-  return Array.from(resultById.values()).filter((result) => result.status !== 'error');
+function getActionableResults(
+  resultById: ReadonlyMap<string, SchemaComparisonResult>,
+  status?: FilterableComparisonStatus,
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
+): SchemaComparisonResult[] {
+  return Array.from(resultById.values()).filter((result) =>
+    result.status !== 'error'
+    && (!status || result.status === status)
+    && (!schema || result.ref.schema === schema)
+    && (!kind || result.ref.kind === kind)
+  );
 }
 
 function getUpdateDatabaseConfirmationMessage(result: SchemaComparisonResult): string {
+  if (isSchemaRef(result.ref)) {
+    return `Create schema ${result.ref.schema} in the live database?`;
+  }
+
   if (result.status === 'missingLocal') {
     return `${result.ref.schema}.${result.ref.name} exists only in the live database. Drop it to match the folder?`;
   }
@@ -729,11 +1091,14 @@ async function openDatabaseMigrationPlan(
 
 async function openAllDatabaseMigrationPlan(
   diffService: SchemaDiffService,
-  resultById: ReadonlyMap<string, SchemaComparisonResult>
+  resultById: ReadonlyMap<string, SchemaComparisonResult>,
+  status?: FilterableComparisonStatus,
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
 ): Promise<void> {
-  const results = getActionableResults(resultById);
+  const results = getActionableResults(resultById, status, schema, kind);
   const uri = await runActionWithProgress(
-    'Preparing full database migration plan...',
+    `Preparing ${getBulkScopeLabel(status, schema, kind).trim() || 'full'} database migration plan...`,
     () => diffService.prepareDatabaseMigrationPlanForResults(results)
   );
 
@@ -745,30 +1110,17 @@ async function openAllDatabaseMigrationPlan(
 
 async function refreshComparisonView(
   webview: vscode.Webview,
-  diffService: SchemaDiffService,
   resultById: Map<string, SchemaComparisonResult>,
-  syncedKinds: SchemaObjectKind | readonly SchemaObjectKind[],
-  onSynced: (kind: SchemaObjectKind) => Promise<void> | void
+  syncedRefs: readonly SchemaComparisonRef[],
+  onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void
 ): Promise<void> {
-  const changedResults = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: 'Refreshing Schema Folder vs Database...',
-      cancellable: false
-    },
-    async () => (await diffService.compareFolderWithDatabase()).filter((result) => result.status !== 'same')
-  );
-  resultById.clear();
-
-  for (const result of changedResults) {
-    resultById.set(getResultId(result.ref), result);
+  for (const ref of syncedRefs) {
+    resultById.delete(getResultId(ref));
   }
 
-  webview.html = renderComparisonHtml(webview, changedResults);
+  webview.html = renderComparisonHtml(Array.from(resultById.values()));
 
-  for (const kind of Array.isArray(syncedKinds) ? syncedKinds : [syncedKinds]) {
-    await onSynced(kind);
-  }
+  await onSynced(syncedRefs);
 }
 
 async function runActionWithProgress<T>(title: string, operation: () => Promise<T>): Promise<T> {
@@ -807,6 +1159,45 @@ function getStatusLabel(status: SchemaComparisonStatus): string {
   }
 }
 
+function getBulkScopeLabel(
+  status: FilterableComparisonStatus | undefined,
+  schema?: string,
+  kind?: SchemaComparisonRef['kind']
+): string {
+  const parts = [
+    schema ? `schema ${schema}` : undefined,
+    kind ? `type ${getTypeLabel(kind)}` : undefined,
+    status ? getStatusLabel(status).toLowerCase() : undefined
+  ]
+    .filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? `${parts.join(', ')} ` : '';
+}
+
+function getTypeLabel(kind: SchemaComparisonRef['kind']): string {
+  switch (kind) {
+    case 'schema':
+      return 'Schema';
+    case 'table':
+      return 'Table';
+    case 'view':
+      return 'View';
+    case 'materializedView':
+      return 'Materialized View';
+    case 'index':
+      return 'Index';
+    case 'function':
+      return 'Function';
+    case 'procedure':
+      return 'Procedure';
+    case 'sequence':
+      return 'Sequence';
+    case 'trigger':
+      return 'Trigger';
+    case 'type':
+      return 'Type';
+  }
+}
+
 function getStatusDetail(status: SchemaComparisonStatus): string {
   switch (status) {
     case 'modified':
@@ -822,8 +1213,8 @@ function getStatusDetail(status: SchemaComparisonStatus): string {
   }
 }
 
-function getResultId(ref: SchemaObjectRef): string {
-  return `${ref.kind}:${ref.schema}:${ref.name}:${ref.identityArguments ?? ''}`;
+function getResultId(ref: SchemaComparisonRef): string {
+  return `${ref.kind}:${ref.schema}:${ref.name}:${isSchemaRef(ref) ? '' : ref.identityArguments ?? ''}`;
 }
 
 function escapeHtml(value: string): string {

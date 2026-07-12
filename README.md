@@ -11,25 +11,23 @@ It provides a database object explorer, local-vs-live diff views, full folder co
 - Compare a local `.sql` file with the live database definition.
 - Compare an object from the sidebar with its matching local schema file.
 - Compare the whole schema folder with the live database in the **Schema Folder vs Database** view.
-- Show detailed change summaries for folder comparison rows.
+- Filter folder differences by schema, object type, and status, with filter-aware bulk actions.
+- Show detailed change summaries for folder comparison rows and per-folder diff counts in the object explorer.
 - Generate a migration plan for one difference or all folder differences.
 - Update the schema folder from the database.
 - Update the live database from local SQL using generated migration plans.
 - Write/export database objects to the schema folder.
 - Reveal configured schema folders and object folders in the OS file explorer.
 
-## What's New in v0.1.0
+## What's New in v0.2.0
 
-`v0.1.0` is a major schema coverage update from the `addmorefields` branch.
-
-- Expanded supported PostgreSQL object types to materialized views, indexes, procedures, triggers, and types.
-- Updated the object explorer, sidebar context menus, folder comparison view, and export flow for the expanded object set.
-- Improved migration plan ordering across dependent object types so generated scripts handle types, sequences, tables, indexes, views, materialized views, functions, procedures, and triggers in a safer order.
-- Improved table migration plans so affected foreign keys are dropped and re-added around referenced key or changed-column constraints instead of using broad table rebuilds.
-- Ignored constraint-backed indexes as standalone local-only differences to reduce noisy folder comparison results.
-- Added loading, empty, and error states to the folder comparison webview.
-- Improved the connection settings webview with stricter validation, clearer status feedback, password visibility controls, and a stricter content security policy.
-- Hid diff-related editor title actions from webviews where those actions are not relevant.
+- Added persistent schema, object-type, and status filters to folder comparisons. Bulk actions apply only to the changes shown by the active filters.
+- Added schema-level folder comparison so local schema folders missing from the database appear as local-only differences and can generate `CREATE SCHEMA IF NOT EXISTS` migration steps.
+- Improved explorer performance with lazy, cached comparisons, per-folder diff counts, and targeted refreshes after synchronization.
+- Added dependency-safe migration phases for local-only types, standalone sequences, tables, and foreign keys.
+- Excluded constraint-backed indexes, table-owned indexes, identity-owned sequences, and database sequences owned by table columns from standalone object differences.
+- Improved PostgreSQL routine handling by preserving routine bodies and ensuring function and procedure statements are correctly terminated when exported, compared, planned, or executed.
+- Treated `varchar`/`character varying` and `char`/`character` as equivalent column type aliases to avoid false differences.
 
 ## Requirements
 
@@ -54,7 +52,7 @@ The extension stores these settings:
 
 ## Supported Object Types
 
-`v0.1.0` supports these PostgreSQL object types in the object explorer, folder comparison, export, and migration plan flows:
+It supports these PostgreSQL object types in the object explorer, folder comparison, export, and migration plan flows:
 
 | Object type | Folder name |
 | --- | --- |
@@ -107,6 +105,8 @@ schema/
 
 Set `postgresSchemaCompare.schemaFolder` to `schema` for the example above.
 
+Dot-prefixed schema folders and SQL files are ignored during local folder scans.
+
 ## Usage
 
 ### Configure and Load the Object Explorer
@@ -117,7 +117,7 @@ Set `postgresSchemaCompare.schemaFolder` to `schema` for the example above.
 4. Save and test the connection.
 5. Use **Refresh from Live Database** if you need to reload the sidebar.
 
-The object explorer shows each object status when a schema folder is configured:
+Object comparisons are loaded and cached as schemas and object-type folders are opened. Loaded folders show `no diff` and `diff` counts, and each object shows its comparison status when a schema folder is configured:
 
 - `same`: local file and database object match.
 - `modified`: local file and database object differ.
@@ -152,13 +152,15 @@ The **Schema Folder vs Database** view shows a loading state while comparison is
 - **Update Folder**: write the live database definition to the local folder, or delete local-only files after confirmation.
 - **Update Database**: apply the local SQL or generated migration plan to the live database after confirmation.
 
-The header action dropdown targets all differences:
+Use the schema and object-type dropdowns together with the status buttons to filter the rows. Filter selections are preserved when the comparison view refreshes.
+
+The header action dropdown targets only the currently shown differences:
 
 - **Migration Plan - All Differences**: opens one combined SQL script for all actionable differences.
 - **Update Folder - All Differences**: updates the folder for every actionable difference.
 - **Update Database - All Differences**: generates the full migration plan and executes that script once.
 
-After update actions, the webview and sidebar refresh.
+After update actions, completed rows are removed immediately and only affected explorer folders are refreshed where possible. Schema changes trigger a full explorer refresh.
 
 ### Write Database to Folder
 
@@ -189,9 +191,11 @@ When changing text-like columns to `jsonb`, generated SQL includes a `USING` cla
 
 When table key constraints or changed columns affect foreign keys, generated plans drop the affected foreign keys before the table changes and re-add them afterward.
 
-For modified non-table objects, the migration plan replaces the object using drop-and-create style SQL where supported by the extension.
+For modified non-table objects, the migration plan replaces the object using drop-and-create style SQL where supported by the extension. Function and procedure definitions are normalized with a terminating semicolon without removing transaction-like text from their bodies.
 
-Combined migration plans are ordered by object type and table dependencies so prerequisite objects are created before dependent objects where practical. Constraint-backed indexes are treated as part of their owning constraints and are not reported as separate local-only index differences.
+For local-only objects, combined plans create schemas first, then prerequisite types and standalone sequences, followed by tables and their deferred foreign keys. New-table foreign keys are separated from `CREATE TABLE` statements so referenced tables can be created first.
+
+Combined migration plans are ordered by object type and table dependencies so prerequisite objects are created before dependent objects where practical. Constraint-backed and table-owned indexes are treated as part of their owning table constraints, while identity-owned sequences are treated as part of their table columns; these objects are not reported or migrated as separate local-only differences.
 
 Review generated migration plans before applying them to important databases.
 

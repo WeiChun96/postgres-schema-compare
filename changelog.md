@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.2.0
+
+Major update.
+
+- Add schema-level folder comparison so local schema folders missing from the live database appear as local-only differences.
+- Generate `CREATE SCHEMA IF NOT EXISTS` migration steps for missing schemas before dependent object changes.
+- Add schema and object-type filters to folder comparisons alongside status filters, preserve the selected filters while results refresh, and scope bulk folder, migration-plan, and database actions to the visible changes.
+- Improve synchronization feedback by removing completed comparison rows immediately and refreshing affected explorer folders once per schema and object type, with a full refresh when schemas change.
+- Load and cache Database Objects explorer comparisons by schema and object type, show per-folder diff counts, and support targeted folder refreshes for faster navigation.
+- Include local SQL objects when loading individual explorer folders and continue ignoring dot-prefixed files.
+- Show local-only schemas in the Database Objects explorer and strengthen the folder comparison webview content security policy with nonce-protected styles and scripts.
+- Generate dependency-safe migration plans for local-only objects by creating types and standalone sequences before tables, creating tables before foreign keys, and deferring new-table foreign keys until their dependencies exist.
+- Exclude constraint-backed indexes, table-owned indexes, and identity-owned sequences from standalone comparisons and migration steps, and omit database sequences owned by table columns from object discovery.
+- Ensure function and procedure definitions end with statement terminators when they are exported, compared, included in migration plans, or executed.
+- Preserve routine bodies when removing migration transaction wrappers, including lines containing transaction-like text.
+- Normalize PostgreSQL `varchar`/`character varying` and `char`/`character` aliases during column comparison to avoid false type differences.
+
 ## v0.1.0
 
 Major update.

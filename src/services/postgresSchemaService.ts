@@ -29,14 +29,16 @@ export class PostgresSchemaService {
   }
 
   public getSqlReplacingObject(ref: SchemaObjectRef, sql: string): string {
+    const executableSql = ensureRoutineTerminator(ref, sql);
+
     if ((ref.kind === 'function' || ref.kind === 'procedure') && !ref.identityArguments) {
-      return ensureTrailingNewline(sql);
+      return ensureTrailingNewline(executableSql);
     }
 
     return ensureTrailingNewline([
       'BEGIN;',
       getDropStatement(ref),
-      sql.trim(),
+      executableSql.trim(),
       'COMMIT;'
     ].join('\n\n'));
   }
@@ -132,6 +134,14 @@ export class PostgresSchemaService {
           where n.nspname not in ('pg_catalog', 'information_schema')
             and n.nspname not like 'pg_toast%'
             and c.relkind = 'S'
+            and not exists (
+              select 1
+              from pg_depend sequence_dependency
+              where sequence_dependency.classid = 'pg_class'::regclass
+                and sequence_dependency.objid = c.oid
+                and sequence_dependency.refclassid = 'pg_class'::regclass
+                and sequence_dependency.deptype in ('a', 'i')
+            )
           union all
           select
             'function' as kind,
@@ -215,6 +225,30 @@ export class PostgresSchemaService {
         identityArguments: row.identityArguments
       }));
     });
+  }
+
+  public async listSchemas(): Promise<string[]> {
+    return this.withClient(async (client) => {
+      const result = await client.query<{ schema: string }>(
+        `
+          select nspname as schema
+          from pg_namespace
+          where nspname not in ('pg_catalog', 'information_schema')
+            and nspname not like 'pg_toast%'
+          order by nspname
+        `
+      );
+
+      return result.rows.map((row) => row.schema);
+    });
+  }
+
+  public getCreateSchemaSql(schema: string): string {
+    return ensureTrailingNewline(`CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(schema)};`);
+  }
+
+  public async createSchema(schema: string): Promise<void> {
+    await this.executeSql(this.getCreateSchemaSql(schema));
   }
 
   public async listConstraintBackedIndexes(): Promise<SchemaObjectRef[]> {
@@ -318,7 +352,7 @@ export class PostgresSchemaService {
       );
     }
 
-    return result.rows[0].ddl;
+    return ensureStatementTerminator(result.rows[0].ddl);
   }
 
   private async queryProcedureDefinition(client: Client, ref: SchemaObjectRef): Promise<string> {
@@ -346,7 +380,7 @@ export class PostgresSchemaService {
       );
     }
 
-    return result.rows[0].ddl;
+    return ensureStatementTerminator(result.rows[0].ddl);
   }
 
   private async queryViewDefinition(client: Client, ref: SchemaObjectRef): Promise<string> {
@@ -599,6 +633,17 @@ function formatQualifiedName(ref: SchemaObjectRef): string {
 
 function ensureTrailingNewline(value: string): string {
   return value.endsWith('\n') ? value : `${value}\n`;
+}
+
+function ensureStatementTerminator(sql: string): string {
+  const trimmed = sql.trimEnd();
+  return trimmed.endsWith(';') ? trimmed : `${trimmed};`;
+}
+
+function ensureRoutineTerminator(ref: SchemaObjectRef, sql: string): string {
+  return ref.kind === 'function' || ref.kind === 'procedure'
+    ? ensureStatementTerminator(sql)
+    : sql;
 }
 
 function getDropStatement(ref: SchemaObjectRef): string {
