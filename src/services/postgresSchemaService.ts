@@ -134,6 +134,14 @@ export class PostgresSchemaService {
           where n.nspname not in ('pg_catalog', 'information_schema')
             and n.nspname not like 'pg_toast%'
             and c.relkind = 'S'
+            and not exists (
+              select 1
+              from pg_depend sequence_dependency
+              where sequence_dependency.classid = 'pg_class'::regclass
+                and sequence_dependency.objid = c.oid
+                and sequence_dependency.refclassid = 'pg_class'::regclass
+                and sequence_dependency.deptype in ('a', 'i')
+            )
           union all
           select
             'function' as kind,

@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ExtensionConfig, getExtensionConfig, hasConnectionConfig } from '../config';
 import { schemaObjectFolderByKind, schemaObjectKinds, SchemaObjectKind, SchemaObjectRef } from '../model/schemaObject';
 import { PostgresSchemaService } from '../services/postgresSchemaService';
-import { areDefinitionsEquivalent } from '../services/schemaDiffService';
+import { areDefinitionsEquivalent, getTableOwnedLocalObjectKeys } from '../services/schemaDiffService';
 import { SchemaFileService } from '../services/schemaFileService';
 
 type ObjectComparisonStatus = 'same' | 'modified' | 'missingLocal' | 'localOnly' | 'error';
@@ -478,9 +478,19 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
 
     const schemaFileService = new SchemaFileService(workspaceFolder, config.schemaFolder, 'public');
     const objectsByKey = new Map(databaseObjects.map((object) => [getObjectKey(object), object]));
-    const ignoredLocalOnlyObjectKeys = kind === 'index'
-      ? new Set((await postgresSchemaService.listConstraintBackedIndexes()).map(getLocalFileObjectKey))
-      : new Set<string>();
+    const ignoredLocalOnlyObjectKeys = new Set<string>();
+
+    if (kind === 'index') {
+      for (const object of await postgresSchemaService.listConstraintBackedIndexes()) {
+        ignoredLocalOnlyObjectKeys.add(getLocalFileObjectKey(object));
+      }
+    }
+
+    if (kind === 'index' || kind === 'sequence') {
+      for (const key of await getTableOwnedLocalObjectKeys(schemaFileService)) {
+        ignoredLocalOnlyObjectKeys.add(key);
+      }
+    }
 
     for (const object of databaseObjects) {
       try {

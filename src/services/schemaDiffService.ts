@@ -362,6 +362,16 @@ export class SchemaDiffService {
       throw new Error(`Local file for ${result.ref.schema}.${result.ref.name} is empty.`);
     }
 
+    if (result.status === 'localOnly' && result.ref.kind === 'table') {
+      return createNewTableMigrationPlanPhases(result.ref, sql, localTables);
+    }
+
+    if (result.status === 'localOnly' && (result.ref.kind === 'type' || result.ref.kind === 'sequence')) {
+      return createMigrationPlanPhases({
+        prerequisites: [sql.trim()]
+      });
+    }
+
     if (result.status === 'modified' && result.ref.kind === 'table') {
       const liveDefinition = await this.postgresSchemaService.getObjectDefinition(result.ref);
       return createTableMigrationPlanPhases(result.ref, liveDefinition.ddl, sql, localTables);
@@ -379,14 +389,18 @@ export class SchemaDiffService {
   }
 
   private async getDatabaseMigrationPlanSqlForResults(results: readonly SchemaComparisonResult[]): Promise<string> {
-    const actionableResults = results.filter((result) => result.status !== 'error');
+    const localTables = await this.getLocalTableDefinitions();
+    const tableOwnedObjectKeys = getTableOwnedObjectKeys(localTables);
+    const actionableResults = results.filter((result) =>
+      result.status !== 'error'
+      && (isSchemaRef(result.ref) || !tableOwnedObjectKeys.has(getLocalFileObjectKey(result.ref)))
+    );
 
     if (actionableResults.length === 0) {
       throw new Error('No database differences are available for migration.');
     }
 
     const combined = createMigrationPlanPhases();
-    const localTables = await this.getLocalTableDefinitions();
 
     for (const result of sortMigrationResultsByTableDependencies(actionableResults, localTables)) {
       appendMigrationPlanPhases(
@@ -442,8 +456,73 @@ export class SchemaDiffService {
 
   private async getIgnoredLocalOnlyObjectKeys(): Promise<ReadonlySet<string>> {
     const constraintBackedIndexes = await this.postgresSchemaService.listConstraintBackedIndexes();
-    return new Set(constraintBackedIndexes.map(getLocalFileObjectKey));
+    const localTables = await this.getLocalTableDefinitions();
+    return new Set([
+      ...constraintBackedIndexes.map(getLocalFileObjectKey),
+      ...getTableOwnedObjectKeys(localTables)
+    ]);
   }
+}
+
+function getTableOwnedObjectKeys(localTables: ReadonlyMap<string, ParsedTableDefinition>): ReadonlySet<string> {
+  const keys = new Set<string>();
+
+  for (const table of localTables.values()) {
+    if (!table.ref) {
+      continue;
+    }
+
+    for (const constraint of table.constraints.values()) {
+      const definition = normalizeSqlFragment(constraint.definition);
+      if (definition.startsWith('primary key') || definition.startsWith('unique')) {
+        keys.add(getLocalFileObjectKey({
+          kind: 'index',
+          schema: table.ref.schema,
+          name: constraint.name
+        }));
+      }
+    }
+
+    for (const column of table.columns.values()) {
+      if (column.identity) {
+        keys.add(getLocalFileObjectKey({
+          kind: 'sequence',
+          schema: table.ref.schema,
+          name: `${table.ref.name}_${column.name}_seq`
+        }));
+      }
+    }
+  }
+
+  return keys;
+}
+
+export async function getTableOwnedLocalObjectKeys(
+  schemaFileService: SchemaFileService
+): Promise<ReadonlySet<string>> {
+  const localTables = new Map<string, ParsedTableDefinition>();
+
+  for (const localObject of await schemaFileService.listLocalObjects()) {
+    if (localObject.kind !== 'table') {
+      continue;
+    }
+
+    const localSql = await schemaFileService.tryReadLocalFile(schemaFileService.getLocalObjectUri(localObject));
+    if (!localSql) {
+      continue;
+    }
+
+    try {
+      localTables.set(getTableDefinitionKey(localObject.schema, localObject.name), {
+        ...parseCreateTableDefinition(localSql),
+        ref: localObject
+      });
+    } catch {
+      // The normal comparison path reports invalid table definitions.
+    }
+  }
+
+  return getTableOwnedObjectKeys(localTables);
 }
 
 function sortMigrationResultsByTableDependencies(
@@ -688,9 +767,11 @@ interface ForeignKeyReference {
 
 interface MigrationPlanPhases {
   readonly createSchemas: string[];
+  readonly prerequisites: string[];
   readonly dropForeignKeys: string[];
   readonly dropPrimaryUniqueCheckConstraints: string[];
   readonly alterColumns: string[];
+  readonly createTables: string[];
   readonly addPrimaryUniqueCheckConstraints: string[];
   readonly addForeignKeys: string[];
   readonly other: string[];
@@ -827,6 +908,49 @@ function summarizeChanges(changes: readonly string[], fallback: string): string 
   const visibleChanges = changes.slice(0, 4);
   const suffix = changes.length > visibleChanges.length ? `, +${changes.length - visibleChanges.length} more` : '';
   return `${visibleChanges.join('; ')}${suffix}`;
+}
+
+function createNewTableMigrationPlanPhases(
+  ref: SchemaObjectRef,
+  localSql: string,
+  localTables?: ReadonlyMap<string, ParsedTableDefinition>
+): MigrationPlanPhases {
+  const openIndex = localSql.indexOf('(');
+  if (openIndex === -1) {
+    throw new Error(`Could not prepare table ${ref.schema}.${ref.name}: missing column list.`);
+  }
+
+  const closeIndex = findMatchingCloseParenthesis(localSql, openIndex);
+  const retainedParts: string[] = [];
+  const foreignKeys: ParsedConstraint[] = [];
+
+  for (const part of splitTopLevelComma(localSql.slice(openIndex + 1, closeIndex))) {
+    const raw = part.trim();
+
+    if (/^CONSTRAINT\b/i.test(raw)) {
+      const constraint = parseConstraintDefinition(raw);
+      if (constraint.kind === 'foreignKey') {
+        foreignKeys.push(constraint);
+        continue;
+      }
+    }
+
+    retainedParts.push(raw);
+  }
+
+  const createTableSql = [
+    `${localSql.slice(0, openIndex + 1).trimEnd()}`,
+    retainedParts.map((part) => `  ${part}`).join(',\n'),
+    `${localSql.slice(closeIndex).trimStart()}`
+  ].join('\n').trim();
+  const tableName = getQualifiedName(ref);
+
+  return createMigrationPlanPhases({
+    createTables: [createTableSql],
+    addForeignKeys: foreignKeys.flatMap((constraint) =>
+      createAddConstraintStatements(ref, tableName, constraint.name, constraint, localTables)
+    )
+  });
 }
 
 function createTableMigrationPlanPhases(
@@ -1026,9 +1150,11 @@ function doesConstraintUseAnyColumn(constraint: ParsedConstraint, columnNames: R
 function createMigrationPlanPhases(values?: Partial<MigrationPlanPhases>): MigrationPlanPhases {
   return {
     createSchemas: values?.createSchemas ?? [],
+    prerequisites: values?.prerequisites ?? [],
     dropForeignKeys: values?.dropForeignKeys ?? [],
     dropPrimaryUniqueCheckConstraints: values?.dropPrimaryUniqueCheckConstraints ?? [],
     alterColumns: values?.alterColumns ?? [],
+    createTables: values?.createTables ?? [],
     addPrimaryUniqueCheckConstraints: values?.addPrimaryUniqueCheckConstraints ?? [],
     addForeignKeys: values?.addForeignKeys ?? [],
     other: values?.other ?? []
@@ -1037,9 +1163,11 @@ function createMigrationPlanPhases(values?: Partial<MigrationPlanPhases>): Migra
 
 function appendMigrationPlanPhases(target: MigrationPlanPhases, source: MigrationPlanPhases, comment: string): void {
   appendPhase(target.createSchemas, source.createSchemas, comment);
+  appendPhase(target.prerequisites, source.prerequisites, comment);
   appendPhase(target.dropForeignKeys, source.dropForeignKeys, comment);
   appendPhase(target.dropPrimaryUniqueCheckConstraints, source.dropPrimaryUniqueCheckConstraints, comment);
   appendPhase(target.alterColumns, source.alterColumns, comment);
+  appendPhase(target.createTables, source.createTables, comment);
   appendPhase(target.addPrimaryUniqueCheckConstraints, source.addPrimaryUniqueCheckConstraints, comment);
   appendPhase(target.addForeignKeys, source.addForeignKeys, comment);
   appendPhase(target.other, source.other, comment);
@@ -1070,11 +1198,13 @@ function formatMigrationPlanPhases(phases: MigrationPlanPhases, wrapTransaction:
 function getMigrationPlanStatements(phases: MigrationPlanPhases): string[] {
   return [
     ...withPhaseHeader('1. Create schemas', uniqueStatements(phases.createSchemas)),
-    ...withPhaseHeader('2. Drop foreign keys', phases.dropForeignKeys),
-    ...withPhaseHeader('3. Drop primary/unique/check constraints', phases.dropPrimaryUniqueCheckConstraints),
-    ...withPhaseHeader('4. Drop/alter/add columns', phases.alterColumns),
-    ...withPhaseHeader('5. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
-    ...withPhaseHeader('6. Add foreign keys', phases.addForeignKeys),
+    ...withPhaseHeader('2. Create prerequisite types and sequences', phases.prerequisites),
+    ...withPhaseHeader('3. Drop foreign keys', phases.dropForeignKeys),
+    ...withPhaseHeader('4. Drop primary/unique/check constraints', phases.dropPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('5. Drop/alter/add columns', phases.alterColumns),
+    ...withPhaseHeader('6. Create tables', phases.createTables),
+    ...withPhaseHeader('7. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('8. Add foreign keys', phases.addForeignKeys),
     ...withPhaseHeader('Other object changes', phases.other)
   ];
 }

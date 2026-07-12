@@ -28,7 +28,7 @@ export function registerCompareFolderWithDatabaseCommand(
   context: vscode.ExtensionContext,
   serviceFactory: ServiceFactory,
   diffSessionState: DiffSessionState,
-  onSynced: (ref: SchemaObjectRef) => Promise<void> | void
+  onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void
 ): void {
   const disposable = vscode.commands.registerCommand(
     'postgresSchemaCompare.compareFolderWithDatabase',
@@ -87,11 +87,8 @@ export function registerCompareFolderWithDatabaseCommand(
               if (message.type === 'updateDatabase') {
                 const didSync = await updateDatabaseFromResult(diffService, result);
 
-                if (didSync && !isSchemaRef(result.ref)) {
+                if (didSync) {
                   await refreshComparisonView(panel.webview, resultById, [result.ref], onSynced);
-                } else if (didSync) {
-                  resultById.delete(getResultId(result.ref));
-                  panel.webview.html = renderComparisonHtml(Array.from(resultById.values()));
                 }
 
                 return;
@@ -993,7 +990,7 @@ async function updateAllFolderDifferences(
   webview: vscode.Webview,
   diffService: SchemaDiffService,
   resultById: Map<string, SchemaComparisonResult>,
-  onSynced: (ref: SchemaObjectRef) => Promise<void> | void,
+  onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void,
   status?: FilterableComparisonStatus,
   schema?: string,
   kind?: SchemaComparisonRef['kind']
@@ -1022,19 +1019,13 @@ async function updateAllDatabaseDifferences(
   webview: vscode.Webview,
   diffService: SchemaDiffService,
   resultById: Map<string, SchemaComparisonResult>,
-  onSynced: (ref: SchemaObjectRef) => Promise<void> | void,
+  onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void,
   status?: FilterableComparisonStatus,
   schema?: string,
   kind?: SchemaComparisonRef['kind']
 ): Promise<void> {
   const results = getActionableResults(resultById, status, schema, kind);
-  const syncedRefs: SchemaObjectRef[] = [];
-
-  for (const result of results) {
-    if (!isSchemaRef(result.ref)) {
-      syncedRefs.push(result.ref);
-    }
-  }
+  const syncedRefs = results.map((result) => result.ref);
 
   const confirmed = await confirmAction(
     `Apply the generated migration plan for ${getBulkScopeLabel(status, schema, kind)}${results.length} difference(s) to the live database?`,
@@ -1050,9 +1041,7 @@ async function updateAllDatabaseDifferences(
     () => diffService.updateDatabaseFromMigrationPlan(results)
   );
 
-  if (syncedRefs.length > 0) {
-    await refreshComparisonView(webview, resultById, syncedRefs, onSynced);
-  }
+  await refreshComparisonView(webview, resultById, syncedRefs, onSynced);
 }
 
 function getActionableResults(
@@ -1122,8 +1111,8 @@ async function openAllDatabaseMigrationPlan(
 async function refreshComparisonView(
   webview: vscode.Webview,
   resultById: Map<string, SchemaComparisonResult>,
-  syncedRefs: readonly SchemaObjectRef[],
-  onSynced: (ref: SchemaObjectRef) => Promise<void> | void
+  syncedRefs: readonly SchemaComparisonRef[],
+  onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void
 ): Promise<void> {
   for (const ref of syncedRefs) {
     resultById.delete(getResultId(ref));
@@ -1131,9 +1120,7 @@ async function refreshComparisonView(
 
   webview.html = renderComparisonHtml(Array.from(resultById.values()));
 
-  for (const ref of syncedRefs) {
-    await onSynced(ref);
-  }
+  await onSynced(syncedRefs);
 }
 
 async function runActionWithProgress<T>(title: string, operation: () => Promise<T>): Promise<T> {

@@ -10,7 +10,7 @@ import { registerSyncActiveDiffCommands } from './commands/syncActiveDiff';
 import { hasConnectionConfig } from './config';
 import { schemaObjectFolderByKind, schemaObjectKinds, SchemaObjectKind } from './model/schemaObject';
 import { DiffSessionState } from './services/diffSessionState';
-import { LiveSchemaDocumentProvider } from './services/schemaDiffService';
+import { isSchemaRef, LiveSchemaDocumentProvider } from './services/schemaDiffService';
 import { ServiceFactory } from './services/serviceFactory';
 import { DatabaseObjectsProvider } from './views/databaseObjectsProvider';
 
@@ -48,7 +48,27 @@ export function activate(context: vscode.ExtensionContext): void {
     diffSessionState,
     (ref) => ref ? databaseObjectsProvider.refreshObject(ref) : databaseObjectsProvider.refresh()
   );
-  registerCompareFolderWithDatabaseCommand(context, serviceFactory, diffSessionState, (ref) => databaseObjectsProvider.refreshObject(ref));
+  registerCompareFolderWithDatabaseCommand(context, serviceFactory, diffSessionState, async (refs) => {
+    if (refs.some(isSchemaRef)) {
+      databaseObjectsProvider.refresh();
+      return;
+    }
+
+    const refreshedFolders = new Set<string>();
+    for (const ref of refs) {
+      if (isSchemaRef(ref)) {
+        continue;
+      }
+
+      const key = `${ref.schema}:${ref.kind}`;
+      if (refreshedFolders.has(key)) {
+        continue;
+      }
+
+      refreshedFolders.add(key);
+      await databaseObjectsProvider.refreshFolder(ref.schema, ref.kind);
+    }
+  });
   registerCompareDatabaseObjectWithFolderCommand(context, serviceFactory, diffSessionState);
   registerExportDatabaseToFolderCommand(context, serviceFactory, () => databaseObjectsProvider.refresh(), outputChannel);
   registerRevealObjectInExplorerCommand(context, serviceFactory);
