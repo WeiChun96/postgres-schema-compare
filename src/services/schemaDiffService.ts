@@ -14,6 +14,8 @@ export type DiffDirection = 'databaseToLocal' | 'localToDatabase';
 
 export type SchemaComparisonStatus = 'modified' | 'missingLocal' | 'localOnly' | 'same' | 'error';
 
+export type TableMigrationStrategy = 'alter' | 'recreate';
+
 export interface SchemaRef {
   readonly kind: 'schema';
   readonly schema: string;
@@ -161,11 +163,13 @@ export class SchemaDiffService {
       }
 
       if (!databaseObjectsByLocalFileKey.has(getLocalFileObjectKey(localObject))) {
-        results.push({
-          ref: localObject,
-          status: 'localOnly',
-          localUri: this.schemaFileService.getLocalObjectUri(localObject)
-        });
+        results.push(localObject.kind === 'sequence'
+          ? await this.compareObjectWithDatabase(localObject)
+          : {
+            ref: localObject,
+            status: 'localOnly',
+            localUri: this.schemaFileService.getLocalObjectUri(localObject)
+          });
       }
     }
 
@@ -282,30 +286,48 @@ export class SchemaDiffService {
       throw new Error(`Local file for ${ref.schema}.${ref.name} is empty.`);
     }
 
-    if (replaceExisting) {
-      await this.postgresSchemaService.executeSql(await this.getDatabaseMigrationPlanSql({ ref, status: 'modified', localUri }));
+    if (replaceExisting || ref.kind === 'sequence') {
+      const plan = await this.getDatabaseMigrationPlanSql({
+        ref,
+        status: replaceExisting ? 'modified' : 'localOnly',
+        localUri
+      });
+      if (plan) {
+        await this.postgresSchemaService.executeSql(plan);
+      }
       return;
     }
 
     await this.postgresSchemaService.executeSql(ensureSqlStatementTerminator(sql));
   }
 
-  public async prepareDatabaseMigrationPlan(result: SchemaComparisonResult): Promise<vscode.Uri> {
+  public async prepareDatabaseMigrationPlan(result: SchemaComparisonResult, tableStrategy: TableMigrationStrategy = 'alter'): Promise<vscode.Uri> {
     if (result.status === 'error') {
       throw new Error(result.message ?? 'Could not prepare a migration plan for this object.');
     }
 
-    const sql = await this.getDatabaseMigrationPlanSql(result);
-    return this.liveDocumentProvider.setDocument(sql, `${result.ref.schema}.${result.ref.name}.migration.sql`);
+    const sql = await this.getDatabaseMigrationPlanSql(result, tableStrategy);
+    const suffix = tableStrategy === 'recreate' ? '.recreate.migration.sql' : '.migration.sql';
+    return this.liveDocumentProvider.setDocument(sql, `${result.ref.schema}.${result.ref.name}${suffix}`);
   }
 
-  public async prepareDatabaseMigrationPlanForResults(results: readonly SchemaComparisonResult[]): Promise<vscode.Uri> {
-    const sql = await this.getDatabaseMigrationPlanSqlForResults(results);
-    return this.liveDocumentProvider.setDocument(sql, 'schema-folder-database.migration.sql');
+  public async prepareDatabaseMigrationPlanForResults(
+    results: readonly SchemaComparisonResult[],
+    tableStrategy: TableMigrationStrategy = 'alter'
+  ): Promise<vscode.Uri> {
+    const sql = await this.getDatabaseMigrationPlanSqlForResults(results, tableStrategy);
+    const suffix = tableStrategy === 'recreate' ? '.recreate.migration.sql' : '.migration.sql';
+    return this.liveDocumentProvider.setDocument(sql, `schema-folder-database${suffix}`);
   }
 
-  public async updateDatabaseFromMigrationPlan(results: readonly SchemaComparisonResult[]): Promise<void> {
-    await this.postgresSchemaService.executeSql(await this.getDatabaseMigrationPlanSqlForResults(results));
+  public async updateDatabaseFromMigrationPlan(
+    results: readonly SchemaComparisonResult[],
+    tableStrategy: TableMigrationStrategy = 'alter'
+  ): Promise<void> {
+    const sql = await this.getDatabaseMigrationPlanSqlForResults(results, tableStrategy);
+    if (sql) {
+      await this.postgresSchemaService.executeSql(sql);
+    }
   }
 
   public async updateDatabaseFromFolderFile(localUri: vscode.Uri, replaceExisting = true): Promise<void> {
@@ -316,8 +338,15 @@ export class SchemaDiffService {
       throw new Error(`Local file ${localUri.fsPath} is empty.`);
     }
 
-    if (replaceExisting) {
-      await this.postgresSchemaService.executeSql(await this.getDatabaseMigrationPlanSql({ ref, status: 'modified', localUri }));
+    if (replaceExisting || ref.kind === 'sequence') {
+      const plan = await this.getDatabaseMigrationPlanSql({
+        ref,
+        status: replaceExisting ? 'modified' : 'localOnly',
+        localUri
+      });
+      if (plan) {
+        await this.postgresSchemaService.executeSql(plan);
+      }
       return;
     }
 
@@ -332,13 +361,16 @@ export class SchemaDiffService {
     await this.postgresSchemaService.dropObject(this.schemaFileService.resolveObjectRefFromFile(localUri));
   }
 
-  private async getDatabaseMigrationPlanSql(result: SchemaComparisonResult): Promise<string> {
-    return formatMigrationPlanPhases(await this.getDatabaseMigrationPlanPhases(result), true);
+  private async getDatabaseMigrationPlanSql(result: SchemaComparisonResult, tableStrategy: TableMigrationStrategy = 'alter'): Promise<string> {
+    return formatMigrationPlanPhases(await this.getDatabaseMigrationPlanPhases(result, undefined, tableStrategy), true);
   }
 
   private async getDatabaseMigrationPlanPhases(
     result: SchemaComparisonResult,
-    localTables?: ReadonlyMap<string, ParsedTableDefinition>
+    localTables?: ReadonlyMap<string, ParsedTableDefinition>,
+    tableStrategy: TableMigrationStrategy = 'alter',
+    liveTableKeys?: ReadonlySet<string>,
+    tableOwnedStatements?: ReadonlyMap<string, TableOwnedStatements>
   ): Promise<MigrationPlanPhases> {
     if (isSchemaRef(result.ref)) {
       if (result.status === 'missingLocal') {
@@ -368,6 +400,24 @@ export class SchemaDiffService {
     }
 
     if (result.status === 'modified' && result.ref.kind === 'table') {
+      if (tableStrategy === 'recreate') {
+        const tableDefinitions = localTables ?? await this.getLocalTableDefinitions();
+        const existingTableKeys = liveTableKeys ?? new Set((await this.postgresSchemaService.listSchemaObjects())
+          .filter((object) => object.kind === 'table')
+          .map((object) => getTableDefinitionKey(object.schema, object.name)));
+        const associatedStatements = tableOwnedStatements ?? await this.getLocalTableOwnedStatements(tableDefinitions);
+        const phases = createNewTableMigrationPlanPhases(result.ref, stripSqlComments(sql), tableDefinitions);
+        const owned = associatedStatements.get(getTableDefinitionKey(result.ref.schema, result.ref.name));
+        phases.createIndexes.push(...(owned?.indexes ?? []));
+        phases.createTriggers.push(...(owned?.triggers ?? []));
+        phases.dropTables.push(
+          '-- WARNING: Recreating this table removes its rows, privileges, comments, and table-owned objects not restored below. Review this plan before running it.',
+          this.postgresSchemaService.getDropObjectSql(result.ref).trim()
+        );
+        appendReferencingForeignKeyRebuilds(result.ref, phases, tableDefinitions, existingTableKeys);
+        return phases;
+      }
+
       const liveDefinition = await this.postgresSchemaService.getObjectDefinition(result.ref);
       return createTableMigrationPlanPhases(result.ref, liveDefinition.ddl, stripSqlComments(sql), localTables);
     }
@@ -376,6 +426,19 @@ export class SchemaDiffService {
       return createMigrationPlanPhases({
         alterSequences: [createAlterSequenceStatement(sql)]
       });
+    }
+
+    if (result.status === 'localOnly' && result.ref.kind === 'sequence') {
+      try {
+        const liveDefinition = await this.postgresSchemaService.getObjectDefinition(result.ref);
+        return areDefinitionsEquivalent(result.ref, liveDefinition.ddl, sql)
+          ? createMigrationPlanPhases()
+          : createMigrationPlanPhases({ alterSequences: [createAlterSequenceStatement(sql)] });
+      } catch (error) {
+        if (!isObjectNotFoundError(error)) {
+          throw error;
+        }
+      }
     }
 
     if (result.status === 'same') {
@@ -396,8 +459,20 @@ export class SchemaDiffService {
     return phases;
   }
 
-  private async getDatabaseMigrationPlanSqlForResults(results: readonly SchemaComparisonResult[]): Promise<string> {
+  private async getDatabaseMigrationPlanSqlForResults(
+    results: readonly SchemaComparisonResult[],
+    tableStrategy: TableMigrationStrategy = 'alter'
+  ): Promise<string> {
     const localTables = await this.getLocalTableDefinitions();
+    const hasModifiedTables = results.some((result) => result.status === 'modified' && result.ref.kind === 'table');
+    const tableOwnedStatements = tableStrategy === 'recreate' && hasModifiedTables
+      ? await this.getLocalTableOwnedStatements(localTables)
+      : undefined;
+    const liveTableKeys = tableStrategy === 'recreate' && hasModifiedTables
+      ? new Set((await this.postgresSchemaService.listSchemaObjects())
+        .filter((object) => object.kind === 'table')
+        .map((object) => getTableDefinitionKey(object.schema, object.name)))
+      : undefined;
     const tableOwnedObjectKeys = getTableOwnedObjectKeys(localTables);
     const actionableResults = results.filter((result) =>
       result.status !== 'error'
@@ -413,7 +488,7 @@ export class SchemaDiffService {
     for (const result of sortMigrationResultsByTableDependencies(actionableResults, localTables)) {
       appendMigrationPlanPhases(
         combined,
-        await this.getDatabaseMigrationPlanPhases(result, localTables),
+        await this.getDatabaseMigrationPlanPhases(result, localTables, tableStrategy, liveTableKeys, tableOwnedStatements),
         `-- ${result.ref.schema}.${result.ref.name} (${result.ref.kind}, ${result.status})`
       );
     }
@@ -460,6 +535,33 @@ export class SchemaDiffService {
     }
 
     return tables;
+  }
+
+  private async getLocalTableOwnedStatements(
+    localTables: ReadonlyMap<string, ParsedTableDefinition>
+  ): Promise<ReadonlyMap<string, TableOwnedStatements>> {
+    const statements = new Map<string, TableOwnedStatements>();
+    const constraintBackedObjectKeys = getTableOwnedObjectKeys(localTables);
+
+    for (const object of await this.schemaFileService.listLocalObjects()) {
+      if ((object.kind !== 'index' && object.kind !== 'trigger') || constraintBackedObjectKeys.has(getLocalFileObjectKey(object))) {
+        continue;
+      }
+
+      const sql = await this.schemaFileService.tryReadLocalFile(this.schemaFileService.getLocalObjectUri(object));
+      if (!sql) {
+        continue;
+      }
+
+      const relation = getCreatedObjectRelation(sql, object);
+      const key = getTableDefinitionKey(relation.schema ?? object.schema, relation.table);
+      const owned = statements.get(key) ?? { indexes: [], triggers: [] };
+      const executableSql = createExecutableObjectSql(object, sql);
+      (object.kind === 'index' ? owned.indexes : owned.triggers).push(executableSql);
+      statements.set(key, owned);
+    }
+
+    return statements;
   }
 
   private async getIgnoredLocalOnlyObjectKeys(): Promise<ReadonlySet<string>> {
@@ -795,6 +897,11 @@ interface MigrationPlanPhases {
   readonly other: string[];
 }
 
+interface TableOwnedStatements {
+  readonly indexes: string[];
+  readonly triggers: string[];
+}
+
 function areTableDefinitionsEquivalent(liveSql: string, localSql: string): boolean {
   const liveTable = parseCreateTableDefinition(liveSql);
   const localTable = parseCreateTableDefinition(localSql);
@@ -1072,7 +1179,8 @@ function hasReferencedKeyConstraintChanges(liveTable: ParsedTableDefinition, loc
 function appendReferencingForeignKeyRebuilds(
   ref: SchemaObjectRef,
   phases: MigrationPlanPhases,
-  localTables: ReadonlyMap<string, ParsedTableDefinition> | undefined
+  localTables: ReadonlyMap<string, ParsedTableDefinition> | undefined,
+  liveTableKeys?: ReadonlySet<string>
 ): void {
   if (!localTables) {
     return;
@@ -1080,6 +1188,10 @@ function appendReferencingForeignKeyRebuilds(
 
   for (const [tableKey, table] of localTables) {
     if (tableKey === getTableDefinitionKey(ref.schema, ref.name)) {
+      continue;
+    }
+
+    if (liveTableKeys && !liveTableKeys.has(tableKey)) {
       continue;
     }
 
@@ -1260,11 +1372,11 @@ function getMigrationPlanStatements(phases: MigrationPlanPhases): string[] {
     ...withPhaseHeader('15. Recreate changed types', phases.recreateTypes),
     ...withPhaseHeader('16. Create tables', phases.createTables),
     ...withPhaseHeader('17. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
-    ...withPhaseHeader('18. Add foreign keys', phases.addForeignKeys),
+    ...withPhaseHeader('18. Add foreign keys', uniqueStatements(phases.addForeignKeys)),
     ...withPhaseHeader('19. Create or replace routines', phases.createRoutines),
-    ...withPhaseHeader('20. Create indexes', phases.createIndexes),
+    ...withPhaseHeader('20. Create indexes', uniqueStatements(phases.createIndexes)),
     ...withPhaseHeader('21. Create views', phases.createViews),
-    ...withPhaseHeader('22. Create triggers', phases.createTriggers),
+    ...withPhaseHeader('22. Create triggers', uniqueStatements(phases.createTriggers)),
     ...withPhaseHeader('Other object changes', phases.other)
   ];
 }
@@ -1604,6 +1716,25 @@ function readQualifiedRelationName(value: string): { readonly schema?: string; r
   };
 }
 
+function getCreatedObjectRelation(sql: string, ref: SchemaObjectRef): { readonly schema?: string; readonly table: string } {
+  const source = stripSqlComments(sql).trimStart();
+  if (ref.kind === 'index' && /^CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\b/i.test(source)) {
+    throw new Error(`Local index ${ref.schema}.${ref.name} uses CONCURRENTLY, which cannot run inside the table recreation transaction.`);
+  }
+
+  const expectedCreate = ref.kind === 'index'
+    ? /^CREATE\s+(?:UNIQUE\s+)?INDEX\b/i
+    : /^CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\b/i;
+  const onIndex = expectedCreate.test(source) ? findTopLevelKeyword(source, 'ON') : undefined;
+
+  if (onIndex === undefined) {
+    throw new Error(`Cannot identify the table for local ${ref.kind} ${ref.schema}.${ref.name} while preparing table recreation.`);
+  }
+
+  const afterOn = source.slice(onIndex + 'ON'.length).trimStart().replace(/^ONLY\b\s*/i, '');
+  return readQualifiedRelationName(afterOn);
+}
+
 function splitTopLevelComma(value: string): string[] {
   const parts: string[] = [];
   let startIndex = 0;
@@ -1726,7 +1857,7 @@ function readIdentifier(value: string): { readonly value: string; readonly endIn
     throw new Error('Expected closing quote for SQL identifier.');
   }
 
-  const match = /^[^\s,()]+/.exec(value.slice(trimmedStart));
+  const match = /^[^\s,.()]+/.exec(value.slice(trimmedStart));
 
   if (!match) {
     throw new Error('Expected SQL identifier.');
