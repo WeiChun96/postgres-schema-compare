@@ -1,6 +1,7 @@
 import { Client, ClientConfig } from 'pg';
 import { ExtensionConfig } from '../config';
 import { SchemaObjectDefinition, SchemaObjectKind, SchemaObjectRef } from '../model/schemaObject';
+import { ensureSqlStatementTerminator } from './sqlTextUtils';
 
 export class PostgresSchemaService {
   public constructor(private readonly config: Pick<ExtensionConfig, 'host' | 'port' | 'database' | 'username' | 'password'>) {}
@@ -29,7 +30,7 @@ export class PostgresSchemaService {
   }
 
   public getSqlReplacingObject(ref: SchemaObjectRef, sql: string): string {
-    const executableSql = ensureRoutineTerminator(ref, sql);
+    const executableSql = ensureSqlStatementTerminator(sql);
 
     if ((ref.kind === 'function' || ref.kind === 'procedure') && !ref.identityArguments) {
       return ensureTrailingNewline(executableSql);
@@ -48,8 +49,10 @@ export class PostgresSchemaService {
   }
 
   public async executeSqlReplacingObject(ref: SchemaObjectRef, sql: string): Promise<void> {
+    const executableSql = ensureSqlStatementTerminator(sql);
+
     if ((ref.kind === 'function' || ref.kind === 'procedure') && !ref.identityArguments) {
-      await this.executeSql(sql);
+      await this.executeSql(executableSql);
       return;
     }
 
@@ -58,7 +61,7 @@ export class PostgresSchemaService {
 
       try {
         await client.query(getDropStatement(ref));
-        await client.query(sql);
+        await client.query(executableSql);
         await client.query('commit');
       } catch (error) {
         await client.query('rollback');
@@ -638,12 +641,6 @@ function ensureTrailingNewline(value: string): string {
 function ensureStatementTerminator(sql: string): string {
   const trimmed = sql.trimEnd();
   return trimmed.endsWith(';') ? trimmed : `${trimmed};`;
-}
-
-function ensureRoutineTerminator(ref: SchemaObjectRef, sql: string): string {
-  return ref.kind === 'function' || ref.kind === 'procedure'
-    ? ensureStatementTerminator(sql)
-    : sql;
 }
 
 function getDropStatement(ref: SchemaObjectRef): string {

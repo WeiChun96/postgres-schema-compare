@@ -903,7 +903,8 @@ function renderBulkActionOptions(results: readonly SchemaComparisonResult[]): st
 
 async function updateFolderFromResult(
   diffService: SchemaDiffService,
-  result: SchemaComparisonResult
+  result: SchemaComparisonResult,
+  confirmChanges = true
 ): Promise<boolean> {
   if (isSchemaRef(result.ref)) {
     await vscode.window.showInformationMessage('Schema rows do not have a local SQL file to update.');
@@ -913,13 +914,15 @@ async function updateFolderFromResult(
   const objectRef = result.ref;
 
   if (result.status === 'localOnly') {
-    const confirmed = await confirmAction(
-      `${objectRef.schema}.${objectRef.name} exists only in the folder. Delete the local file to match the live database?`,
-      'Delete Local File'
-    );
+    if (confirmChanges) {
+      const confirmed = await confirmAction(
+        `${objectRef.schema}.${objectRef.name} exists only in the folder. Delete the local file to match the live database?`,
+        'Delete Local File'
+      );
 
-    if (!confirmed) {
-      return false;
+      if (!confirmed) {
+        return false;
+      }
     }
 
     await runActionWithProgress(
@@ -929,7 +932,7 @@ async function updateFolderFromResult(
     return true;
   }
 
-  if (result.status === 'missingLocal') {
+  if (result.status === 'missingLocal' && confirmChanges) {
     const confirmed = await confirmAction(
       `${objectRef.schema}.${objectRef.name} exists only in the live database. Create the local file to match the live database?`,
       'Create Local File'
@@ -995,15 +998,26 @@ async function updateAllFolderDifferences(
   schema?: string,
   kind?: SchemaComparisonRef['kind']
 ): Promise<void> {
-  const results = getActionableResults(resultById, status, schema, kind);
+  const results = getActionableResults(resultById, status, schema, kind)
+    .filter((result): result is SchemaComparisonResult & { readonly ref: SchemaObjectRef } => !isSchemaRef(result.ref));
   const syncedRefs: SchemaObjectRef[] = [];
 
-  for (const result of results) {
-    if (isSchemaRef(result.ref)) {
-      continue;
-    }
+  if (results.length === 0) {
+    await vscode.window.showInformationMessage('There are no local schema files to update for this selection.');
+    return;
+  }
 
-    const didSync = await updateFolderFromResult(diffService, result);
+  const confirmed = await confirmAction(
+    `Update the folder for ${getBulkScopeLabel(status, schema, kind)}${results.length} difference(s)? Local-only files will be deleted and database-only files will be created.`,
+    'Update Folder'
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  for (const result of results) {
+    const didSync = await updateFolderFromResult(diffService, result, false);
 
     if (didSync) {
       syncedRefs.push(result.ref);

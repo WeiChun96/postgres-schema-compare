@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { SchemaObjectKind, SchemaObjectRef } from '../model/schemaObject';
 import { PostgresSchemaService } from './postgresSchemaService';
 import { SchemaFileService } from './schemaFileService';
+import { ensureSqlStatementTerminator, normalizeSqlForComparison, stripSqlComments } from './sqlTextUtils';
 
 export interface PreparedSchemaDiff {
   readonly leftUri: vscode.Uri;
@@ -277,7 +278,7 @@ export class SchemaDiffService {
     const localUri = this.schemaFileService.getLocalObjectUri(ref);
     const sql = await this.schemaFileService.readLocalFile(localUri);
 
-    if (!normalizeSql(sql)) {
+    if (!normalizeSqlForComparison(sql)) {
       throw new Error(`Local file for ${ref.schema}.${ref.name} is empty.`);
     }
 
@@ -286,7 +287,7 @@ export class SchemaDiffService {
       return;
     }
 
-    await this.postgresSchemaService.executeSql(ensureRoutineTerminator(ref, sql));
+    await this.postgresSchemaService.executeSql(ensureSqlStatementTerminator(sql));
   }
 
   public async prepareDatabaseMigrationPlan(result: SchemaComparisonResult): Promise<vscode.Uri> {
@@ -311,7 +312,7 @@ export class SchemaDiffService {
     const ref = this.schemaFileService.resolveObjectRefFromFile(localUri);
     const sql = await this.schemaFileService.readLocalFile(localUri);
 
-    if (!normalizeSql(sql)) {
+    if (!normalizeSqlForComparison(sql)) {
       throw new Error(`Local file ${localUri.fsPath} is empty.`);
     }
 
@@ -320,7 +321,7 @@ export class SchemaDiffService {
       return;
     }
 
-    await this.postgresSchemaService.executeSql(ensureRoutineTerminator(ref, sql));
+    await this.postgresSchemaService.executeSql(ensureSqlStatementTerminator(sql));
   }
 
   public async dropDatabaseObject(ref: SchemaObjectRef): Promise<void> {
@@ -350,42 +351,49 @@ export class SchemaDiffService {
     }
 
     if (result.status === 'missingLocal') {
-      return createMigrationPlanPhases({
-        other: [this.postgresSchemaService.getDropObjectSql(result.ref).trim()]
-      });
+      const phases = createMigrationPlanPhases();
+      getDropObjectPhase(phases, result.ref.kind).push(this.postgresSchemaService.getDropObjectSql(result.ref).trim());
+      return phases;
     }
 
     const localUri = result.localUri ?? this.schemaFileService.getLocalObjectUri(result.ref);
     const sql = await this.schemaFileService.readLocalFile(localUri);
 
-    if (!normalizeSql(sql)) {
+    if (!normalizeSqlForComparison(sql)) {
       throw new Error(`Local file for ${result.ref.schema}.${result.ref.name} is empty.`);
     }
 
     if (result.status === 'localOnly' && result.ref.kind === 'table') {
-      return createNewTableMigrationPlanPhases(result.ref, sql, localTables);
-    }
-
-    if (result.status === 'localOnly' && (result.ref.kind === 'type' || result.ref.kind === 'sequence')) {
-      return createMigrationPlanPhases({
-        prerequisites: [sql.trim()]
-      });
+      return createNewTableMigrationPlanPhases(result.ref, stripSqlComments(sql), localTables);
     }
 
     if (result.status === 'modified' && result.ref.kind === 'table') {
       const liveDefinition = await this.postgresSchemaService.getObjectDefinition(result.ref);
-      return createTableMigrationPlanPhases(result.ref, liveDefinition.ddl, sql, localTables);
+      return createTableMigrationPlanPhases(result.ref, liveDefinition.ddl, stripSqlComments(sql), localTables);
     }
 
-    if (result.status === 'modified') {
+    if (result.status === 'modified' && result.ref.kind === 'sequence') {
       return createMigrationPlanPhases({
-        other: [stripTransactionWrapper(this.postgresSchemaService.getSqlReplacingObject(result.ref, sql)).trim()]
+        alterSequences: [createAlterSequenceStatement(sql)]
       });
     }
 
-    return createMigrationPlanPhases({
-      other: [ensureRoutineTerminator(result.ref, sql).trim()]
-    });
+    if (result.status === 'same') {
+      return createMigrationPlanPhases();
+    }
+
+    const phases = createMigrationPlanPhases();
+
+    if (result.status === 'modified' && requiresDropBeforeCreate(result.ref.kind)) {
+      getDropObjectPhase(phases, result.ref.kind).push(this.postgresSchemaService.getDropObjectSql(result.ref).trim());
+    }
+
+    getCreateObjectPhase(
+      phases,
+      result.ref.kind,
+      result.status === 'modified' && requiresDropBeforeCreate(result.ref.kind)
+    ).push(createExecutableObjectSql(result.ref, sql));
+    return phases;
   }
 
   private async getDatabaseMigrationPlanSqlForResults(results: readonly SchemaComparisonResult[]): Promise<string> {
@@ -443,7 +451,7 @@ export class SchemaDiffService {
 
       try {
         tables.set(getTableDefinitionKey(localObject.schema, localObject.name), {
-          ...parseCreateTableDefinition(localSql),
+          ...parseCreateTableDefinition(stripSqlComments(localSql)),
           ref: localObject
         });
       } catch {
@@ -514,7 +522,7 @@ export async function getTableOwnedLocalObjectKeys(
 
     try {
       localTables.set(getTableDefinitionKey(localObject.schema, localObject.name), {
-        ...parseCreateTableDefinition(localSql),
+        ...parseCreateTableDefinition(stripSqlComments(localSql)),
         ref: localObject
       });
     } catch {
@@ -700,30 +708,26 @@ function getLocalFileObjectKey(ref: SchemaObjectRef): string {
   return `${ref.kind}:${ref.schema}.${ref.name}`;
 }
 
-function normalizeSql(sql: string): string {
-  return sql.replace(/\r\n/g, '\n').trim();
-}
-
 function ensureTrailingNewline(value: string): string {
   return value.endsWith('\n') ? value : `${value}\n`;
 }
 
 export function areDefinitionsEquivalent(ref: SchemaObjectRef, liveSql: string, localSql: string): boolean {
   if (ref.kind !== 'table') {
-    return normalizeSql(liveSql) === normalizeSql(localSql);
+    return normalizeSqlForComparison(liveSql) === normalizeSqlForComparison(localSql);
   }
 
   try {
-    return areTableDefinitionsEquivalent(liveSql, localSql);
+    return areTableDefinitionsEquivalent(stripSqlComments(liveSql), stripSqlComments(localSql));
   } catch {
-    return normalizeSql(liveSql) === normalizeSql(localSql);
+    return normalizeSqlForComparison(liveSql) === normalizeSqlForComparison(localSql);
   }
 }
 
 export function describeDefinitionChanges(ref: SchemaObjectRef, liveSql: string, localSql: string): string {
   if (ref.kind === 'table') {
     try {
-      return describeTableDefinitionChanges(liveSql, localSql);
+      return describeTableDefinitionChanges(stripSqlComments(liveSql), stripSqlComments(localSql));
     } catch {
       return describeSqlLineChanges(liveSql, localSql);
     }
@@ -766,14 +770,28 @@ interface ForeignKeyReference {
 }
 
 interface MigrationPlanPhases {
+  readonly dropTriggers: string[];
+  readonly dropViews: string[];
+  readonly dropIndexes: string[];
+  readonly dropRoutines: string[];
   readonly createSchemas: string[];
-  readonly prerequisites: string[];
   readonly dropForeignKeys: string[];
   readonly dropPrimaryUniqueCheckConstraints: string[];
   readonly alterColumns: string[];
+  readonly dropTables: string[];
+  readonly dropSequences: string[];
+  readonly dropTypes: string[];
+  readonly createTypes: string[];
+  readonly recreateTypes: string[];
+  readonly createSequences: string[];
+  readonly alterSequences: string[];
   readonly createTables: string[];
   readonly addPrimaryUniqueCheckConstraints: string[];
   readonly addForeignKeys: string[];
+  readonly createRoutines: string[];
+  readonly createIndexes: string[];
+  readonly createViews: string[];
+  readonly createTriggers: string[];
   readonly other: string[];
 }
 
@@ -884,8 +902,8 @@ function describeColumnChanges(liveColumn: ParsedColumn, localColumn: ParsedColu
 }
 
 function describeSqlLineChanges(liveSql: string, localSql: string): string {
-  const liveLines = normalizeSql(liveSql).split('\n');
-  const localLines = normalizeSql(localSql).split('\n');
+  const liveLines = normalizeSqlForComparison(liveSql).split('\n');
+  const localLines = normalizeSqlForComparison(localSql).split('\n');
   const maxLength = Math.max(liveLines.length, localLines.length);
 
   for (let index = 0; index < maxLength; index += 1) {
@@ -946,7 +964,7 @@ function createNewTableMigrationPlanPhases(
   const tableName = getQualifiedName(ref);
 
   return createMigrationPlanPhases({
-    createTables: [createTableSql],
+    createTables: [ensureSqlStatementTerminator(createTableSql)],
     addForeignKeys: foreignKeys.flatMap((constraint) =>
       createAddConstraintStatements(ref, tableName, constraint.name, constraint, localTables)
     )
@@ -1149,27 +1167,55 @@ function doesConstraintUseAnyColumn(constraint: ParsedConstraint, columnNames: R
 
 function createMigrationPlanPhases(values?: Partial<MigrationPlanPhases>): MigrationPlanPhases {
   return {
+    dropTriggers: values?.dropTriggers ?? [],
+    dropViews: values?.dropViews ?? [],
+    dropIndexes: values?.dropIndexes ?? [],
+    dropRoutines: values?.dropRoutines ?? [],
     createSchemas: values?.createSchemas ?? [],
-    prerequisites: values?.prerequisites ?? [],
     dropForeignKeys: values?.dropForeignKeys ?? [],
     dropPrimaryUniqueCheckConstraints: values?.dropPrimaryUniqueCheckConstraints ?? [],
     alterColumns: values?.alterColumns ?? [],
+    dropTables: values?.dropTables ?? [],
+    dropSequences: values?.dropSequences ?? [],
+    dropTypes: values?.dropTypes ?? [],
+    createTypes: values?.createTypes ?? [],
+    recreateTypes: values?.recreateTypes ?? [],
+    createSequences: values?.createSequences ?? [],
+    alterSequences: values?.alterSequences ?? [],
     createTables: values?.createTables ?? [],
     addPrimaryUniqueCheckConstraints: values?.addPrimaryUniqueCheckConstraints ?? [],
     addForeignKeys: values?.addForeignKeys ?? [],
+    createRoutines: values?.createRoutines ?? [],
+    createIndexes: values?.createIndexes ?? [],
+    createViews: values?.createViews ?? [],
+    createTriggers: values?.createTriggers ?? [],
     other: values?.other ?? []
   };
 }
 
 function appendMigrationPlanPhases(target: MigrationPlanPhases, source: MigrationPlanPhases, comment: string): void {
+  appendPhase(target.dropTriggers, source.dropTriggers, comment);
+  appendPhase(target.dropViews, source.dropViews, comment);
+  appendPhase(target.dropIndexes, source.dropIndexes, comment);
+  appendPhase(target.dropRoutines, source.dropRoutines, comment);
   appendPhase(target.createSchemas, source.createSchemas, comment);
-  appendPhase(target.prerequisites, source.prerequisites, comment);
   appendPhase(target.dropForeignKeys, source.dropForeignKeys, comment);
   appendPhase(target.dropPrimaryUniqueCheckConstraints, source.dropPrimaryUniqueCheckConstraints, comment);
   appendPhase(target.alterColumns, source.alterColumns, comment);
+  appendPhase(target.dropTables, source.dropTables, comment);
+  appendPhase(target.dropSequences, source.dropSequences, comment);
+  appendPhase(target.dropTypes, source.dropTypes, comment);
+  appendPhase(target.createTypes, source.createTypes, comment);
+  appendPhase(target.recreateTypes, source.recreateTypes, comment);
+  appendPhase(target.createSequences, source.createSequences, comment);
+  appendPhase(target.alterSequences, source.alterSequences, comment);
   appendPhase(target.createTables, source.createTables, comment);
   appendPhase(target.addPrimaryUniqueCheckConstraints, source.addPrimaryUniqueCheckConstraints, comment);
   appendPhase(target.addForeignKeys, source.addForeignKeys, comment);
+  appendPhase(target.createRoutines, source.createRoutines, comment);
+  appendPhase(target.createIndexes, source.createIndexes, comment);
+  appendPhase(target.createViews, source.createViews, comment);
+  appendPhase(target.createTriggers, source.createTriggers, comment);
   appendPhase(target.other, source.other, comment);
 }
 
@@ -1197,14 +1243,28 @@ function formatMigrationPlanPhases(phases: MigrationPlanPhases, wrapTransaction:
 
 function getMigrationPlanStatements(phases: MigrationPlanPhases): string[] {
   return [
-    ...withPhaseHeader('1. Create schemas', uniqueStatements(phases.createSchemas)),
-    ...withPhaseHeader('2. Create prerequisite types and sequences', phases.prerequisites),
-    ...withPhaseHeader('3. Drop foreign keys', phases.dropForeignKeys),
-    ...withPhaseHeader('4. Drop primary/unique/check constraints', phases.dropPrimaryUniqueCheckConstraints),
-    ...withPhaseHeader('5. Drop/alter/add columns', phases.alterColumns),
-    ...withPhaseHeader('6. Create tables', phases.createTables),
-    ...withPhaseHeader('7. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
-    ...withPhaseHeader('8. Add foreign keys', phases.addForeignKeys),
+    ...withPhaseHeader('1. Drop dependent triggers', phases.dropTriggers),
+    ...withPhaseHeader('2. Drop dependent views', phases.dropViews),
+    ...withPhaseHeader('3. Drop dependent indexes', phases.dropIndexes),
+    ...withPhaseHeader('4. Drop dependent routines', phases.dropRoutines),
+    ...withPhaseHeader('5. Drop foreign keys', phases.dropForeignKeys),
+    ...withPhaseHeader('6. Drop primary/unique/check constraints', phases.dropPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('7. Create schemas', uniqueStatements(phases.createSchemas)),
+    ...withPhaseHeader('8. Create prerequisite types', phases.createTypes),
+    ...withPhaseHeader('9. Create prerequisite sequences', phases.createSequences),
+    ...withPhaseHeader('10. Alter sequences', phases.alterSequences),
+    ...withPhaseHeader('11. Drop/alter/add columns', phases.alterColumns),
+    ...withPhaseHeader('12. Drop tables', phases.dropTables),
+    ...withPhaseHeader('13. Drop sequences', phases.dropSequences),
+    ...withPhaseHeader('14. Drop types', phases.dropTypes),
+    ...withPhaseHeader('15. Recreate changed types', phases.recreateTypes),
+    ...withPhaseHeader('16. Create tables', phases.createTables),
+    ...withPhaseHeader('17. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('18. Add foreign keys', phases.addForeignKeys),
+    ...withPhaseHeader('19. Create or replace routines', phases.createRoutines),
+    ...withPhaseHeader('20. Create indexes', phases.createIndexes),
+    ...withPhaseHeader('21. Create views', phases.createViews),
+    ...withPhaseHeader('22. Create triggers', phases.createTriggers),
     ...withPhaseHeader('Other object changes', phases.other)
   ];
 }
@@ -1239,6 +1299,82 @@ function getAddConstraintPhase(phases: MigrationPlanPhases, constraint: ParsedCo
   }
 
   return phases.other;
+}
+
+function getDropObjectPhase(phases: MigrationPlanPhases, kind: SchemaObjectKind): string[] {
+  switch (kind) {
+    case 'trigger':
+      return phases.dropTriggers;
+    case 'view':
+    case 'materializedView':
+      return phases.dropViews;
+    case 'index':
+      return phases.dropIndexes;
+    case 'function':
+    case 'procedure':
+      return phases.dropRoutines;
+    case 'table':
+      return phases.dropTables;
+    case 'sequence':
+      return phases.dropSequences;
+    case 'type':
+      return phases.dropTypes;
+  }
+}
+
+function getCreateObjectPhase(phases: MigrationPlanPhases, kind: SchemaObjectKind, replacing: boolean): string[] {
+  switch (kind) {
+    case 'type':
+      return replacing ? phases.recreateTypes : phases.createTypes;
+    case 'sequence':
+      return phases.createSequences;
+    case 'table':
+      return phases.createTables;
+    case 'function':
+    case 'procedure':
+      return phases.createRoutines;
+    case 'index':
+      return phases.createIndexes;
+    case 'view':
+    case 'materializedView':
+      return phases.createViews;
+    case 'trigger':
+      return phases.createTriggers;
+  }
+}
+
+function requiresDropBeforeCreate(kind: SchemaObjectKind): boolean {
+  return kind === 'type' || kind === 'index' || kind === 'materializedView' || kind === 'trigger';
+}
+
+function createExecutableObjectSql(ref: SchemaObjectRef, sql: string): string {
+  let executableSql = stripSqlComments(sql).trim();
+
+  if (ref.kind === 'function') {
+    executableSql = addOrReplaceClause(executableSql, 'FUNCTION');
+  } else if (ref.kind === 'procedure') {
+    executableSql = addOrReplaceClause(executableSql, 'PROCEDURE');
+  } else if (ref.kind === 'view') {
+    executableSql = addOrReplaceClause(executableSql, 'VIEW');
+  }
+
+  return ensureSqlStatementTerminator(executableSql).trim();
+}
+
+function addOrReplaceClause(sql: string, objectKeyword: 'FUNCTION' | 'PROCEDURE' | 'VIEW'): string {
+  const createPattern = new RegExp(`^CREATE\\s+(?!OR\\s+REPLACE\\s+)${objectKeyword}\\b`, 'i');
+  return sql.replace(createPattern, `CREATE OR REPLACE ${objectKeyword}`);
+}
+
+function createAlterSequenceStatement(sql: string): string {
+  const createSequencePattern = /^CREATE\s+(?:(?:TEMPORARY|TEMP|UNLOGGED)\s+)?SEQUENCE\s+(?:IF\s+NOT\s+EXISTS\s+)?/i;
+  const createSql = stripSqlComments(sql).trim().replace(/;+\s*$/, '');
+
+  if (!createSequencePattern.test(createSql)) {
+    throw new Error('Could not prepare sequence migration: expected a CREATE SEQUENCE statement.');
+  }
+
+  return ensureSqlStatementTerminator(createSql.replace(createSequencePattern, 'ALTER SEQUENCE ')).trim();
 }
 
 function createAddConstraintStatements(
@@ -1306,23 +1442,6 @@ function getConstraintKind(definition: string): ParsedConstraintKind {
   }
 
   return 'other';
-}
-
-function stripTransactionWrapper(sql: string): string {
-  return sql
-    .trim()
-    .replace(/^BEGIN\s*;\s*/i, '')
-    .replace(/\s*COMMIT\s*;\s*$/i, '')
-    .trim();
-}
-
-function ensureRoutineTerminator(ref: SchemaObjectRef, sql: string): string {
-  if (ref.kind !== 'function' && ref.kind !== 'procedure') {
-    return sql;
-  }
-
-  const trimmed = sql.trimEnd();
-  return trimmed.endsWith(';') ? trimmed : `${trimmed};`;
 }
 
 function parseCreateTableDefinition(sql: string): ParsedTableDefinition {

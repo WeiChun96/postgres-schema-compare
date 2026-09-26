@@ -137,7 +137,7 @@
         "postgresSchemaCompare.schemaFolder": {
           "type": "string",
           "default": "",
-          "description": "Workspace-relative folder containing PostgreSQL schema object subfolders."
+          "description": "Folder containing PostgreSQL schema object subfolders. The folder picker stores its full path."
         }
       }
     },
@@ -267,6 +267,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
+    "test": "npm run compile && node --test --test-isolation=none test/*.test.js",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
     "package:vsix": "npx @vscode/vsce package --allow-missing-repository"
