@@ -149,16 +149,22 @@ The **Schema Folder vs Database** view shows a loading state while comparison is
 
 - **Compare**: open the VS Code diff view.
 - **Migration Plan**: open the generated SQL plan for that row.
+- **Migration Plan — Drop and Recreate Table**: for a modified table, preview a separate plan that replaces the table from its local SQL definition.
 - **Update Folder**: write the live database definition to the local folder, or delete local-only files after confirmation.
 - **Update Database**: apply the local SQL or generated migration plan to the live database after confirmation.
+- **Update Database — Drop and Recreate Table**: run the replacement plan for a modified table after a data-loss confirmation.
 
-Use the schema and object-type dropdowns together with the status buttons to filter the rows. Filter selections are preserved when the comparison view refreshes.
+The standard table plan uses `ALTER TABLE`. The separate replacement plan drops modified tables without `CASCADE`, recreates them, and restores local constraints, indexes, triggers, and referencing foreign keys that the plan can identify. It deletes table rows and may lose privileges, comments, or objects missing from local SQL. Other dependent objects can block the drop. Review the generated plan before running this option. **Update Folder** continues to copy database definitions to local files.
+
+The comparison table fills the editor width. Drag a column header edge to resize it; the Action column remains visible while the table scrolls horizontally. Use the schema and object-type dropdowns together with the status buttons to filter the rows. Filter selections are preserved when the comparison view refreshes.
 
 The header action dropdown targets only the currently shown differences:
 
 - **Migration Plan - All Differences**: opens one combined SQL script for all actionable differences.
+- **Migration Plan - Recreate Modified Tables**: previews a combined plan that replaces modified tables and uses the standard migration behavior for other objects.
 - **Update Folder - All Differences**: updates the folder for every actionable difference.
 - **Update Database - All Differences**: generates the full migration plan and executes that script once.
+- **Update Database - Recreate Modified Tables**: runs the combined replacement plan after a data-loss confirmation.
 
 After update actions, completed rows are removed immediately and only affected explorer folders are refreshed where possible. Schema changes trigger a full explorer refresh.
 

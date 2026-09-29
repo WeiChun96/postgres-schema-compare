@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { SchemaObjectKind, SchemaObjectRef } from '../model/schemaObject';
 import { PostgresSchemaService } from './postgresSchemaService';
 import { SchemaFileService } from './schemaFileService';
+import { ensureSqlStatementTerminator, normalizeSqlForComparison, stripSqlComments } from './sqlTextUtils';
 
 export interface PreparedSchemaDiff {
   readonly leftUri: vscode.Uri;
@@ -12,6 +13,8 @@ export interface PreparedSchemaDiff {
 export type DiffDirection = 'databaseToLocal' | 'localToDatabase';
 
 export type SchemaComparisonStatus = 'modified' | 'missingLocal' | 'localOnly' | 'same' | 'error';
+
+export type TableMigrationStrategy = 'alter' | 'recreate';
 
 export interface SchemaRef {
   readonly kind: 'schema';
@@ -160,11 +163,13 @@ export class SchemaDiffService {
       }
 
       if (!databaseObjectsByLocalFileKey.has(getLocalFileObjectKey(localObject))) {
-        results.push({
-          ref: localObject,
-          status: 'localOnly',
-          localUri: this.schemaFileService.getLocalObjectUri(localObject)
-        });
+        results.push(localObject.kind === 'sequence'
+          ? await this.compareObjectWithDatabase(localObject)
+          : {
+            ref: localObject,
+            status: 'localOnly',
+            localUri: this.schemaFileService.getLocalObjectUri(localObject)
+          });
       }
     }
 
@@ -277,50 +282,75 @@ export class SchemaDiffService {
     const localUri = this.schemaFileService.getLocalObjectUri(ref);
     const sql = await this.schemaFileService.readLocalFile(localUri);
 
-    if (!normalizeSql(sql)) {
+    if (!normalizeSqlForComparison(sql)) {
       throw new Error(`Local file for ${ref.schema}.${ref.name} is empty.`);
     }
 
-    if (replaceExisting) {
-      await this.postgresSchemaService.executeSql(await this.getDatabaseMigrationPlanSql({ ref, status: 'modified', localUri }));
+    if (replaceExisting || ref.kind === 'sequence') {
+      const plan = await this.getDatabaseMigrationPlanSql({
+        ref,
+        status: replaceExisting ? 'modified' : 'localOnly',
+        localUri
+      });
+      if (plan) {
+        await this.postgresSchemaService.executeSql(plan);
+      }
       return;
     }
 
-    await this.postgresSchemaService.executeSql(ensureRoutineTerminator(ref, sql));
+    await this.postgresSchemaService.executeSql(ensureSqlStatementTerminator(sql));
   }
 
-  public async prepareDatabaseMigrationPlan(result: SchemaComparisonResult): Promise<vscode.Uri> {
+  public async prepareDatabaseMigrationPlan(result: SchemaComparisonResult, tableStrategy: TableMigrationStrategy = 'alter'): Promise<vscode.Uri> {
     if (result.status === 'error') {
       throw new Error(result.message ?? 'Could not prepare a migration plan for this object.');
     }
 
-    const sql = await this.getDatabaseMigrationPlanSql(result);
-    return this.liveDocumentProvider.setDocument(sql, `${result.ref.schema}.${result.ref.name}.migration.sql`);
+    const sql = await this.getDatabaseMigrationPlanSql(result, tableStrategy);
+    const suffix = tableStrategy === 'recreate' ? '.recreate.migration.sql' : '.migration.sql';
+    return this.liveDocumentProvider.setDocument(sql, `${result.ref.schema}.${result.ref.name}${suffix}`);
   }
 
-  public async prepareDatabaseMigrationPlanForResults(results: readonly SchemaComparisonResult[]): Promise<vscode.Uri> {
-    const sql = await this.getDatabaseMigrationPlanSqlForResults(results);
-    return this.liveDocumentProvider.setDocument(sql, 'schema-folder-database.migration.sql');
+  public async prepareDatabaseMigrationPlanForResults(
+    results: readonly SchemaComparisonResult[],
+    tableStrategy: TableMigrationStrategy = 'alter'
+  ): Promise<vscode.Uri> {
+    const sql = await this.getDatabaseMigrationPlanSqlForResults(results, tableStrategy);
+    const suffix = tableStrategy === 'recreate' ? '.recreate.migration.sql' : '.migration.sql';
+    return this.liveDocumentProvider.setDocument(sql, `schema-folder-database${suffix}`);
   }
 
-  public async updateDatabaseFromMigrationPlan(results: readonly SchemaComparisonResult[]): Promise<void> {
-    await this.postgresSchemaService.executeSql(await this.getDatabaseMigrationPlanSqlForResults(results));
+  public async updateDatabaseFromMigrationPlan(
+    results: readonly SchemaComparisonResult[],
+    tableStrategy: TableMigrationStrategy = 'alter'
+  ): Promise<void> {
+    const sql = await this.getDatabaseMigrationPlanSqlForResults(results, tableStrategy);
+    if (sql) {
+      await this.postgresSchemaService.executeSql(sql);
+    }
   }
 
   public async updateDatabaseFromFolderFile(localUri: vscode.Uri, replaceExisting = true): Promise<void> {
     const ref = this.schemaFileService.resolveObjectRefFromFile(localUri);
     const sql = await this.schemaFileService.readLocalFile(localUri);
 
-    if (!normalizeSql(sql)) {
+    if (!normalizeSqlForComparison(sql)) {
       throw new Error(`Local file ${localUri.fsPath} is empty.`);
     }
 
-    if (replaceExisting) {
-      await this.postgresSchemaService.executeSql(await this.getDatabaseMigrationPlanSql({ ref, status: 'modified', localUri }));
+    if (replaceExisting || ref.kind === 'sequence') {
+      const plan = await this.getDatabaseMigrationPlanSql({
+        ref,
+        status: replaceExisting ? 'modified' : 'localOnly',
+        localUri
+      });
+      if (plan) {
+        await this.postgresSchemaService.executeSql(plan);
+      }
       return;
     }
 
-    await this.postgresSchemaService.executeSql(ensureRoutineTerminator(ref, sql));
+    await this.postgresSchemaService.executeSql(ensureSqlStatementTerminator(sql));
   }
 
   public async dropDatabaseObject(ref: SchemaObjectRef): Promise<void> {
@@ -331,13 +361,16 @@ export class SchemaDiffService {
     await this.postgresSchemaService.dropObject(this.schemaFileService.resolveObjectRefFromFile(localUri));
   }
 
-  private async getDatabaseMigrationPlanSql(result: SchemaComparisonResult): Promise<string> {
-    return formatMigrationPlanPhases(await this.getDatabaseMigrationPlanPhases(result), true);
+  private async getDatabaseMigrationPlanSql(result: SchemaComparisonResult, tableStrategy: TableMigrationStrategy = 'alter'): Promise<string> {
+    return formatMigrationPlanPhases(await this.getDatabaseMigrationPlanPhases(result, undefined, tableStrategy), true);
   }
 
   private async getDatabaseMigrationPlanPhases(
     result: SchemaComparisonResult,
-    localTables?: ReadonlyMap<string, ParsedTableDefinition>
+    localTables?: ReadonlyMap<string, ParsedTableDefinition>,
+    tableStrategy: TableMigrationStrategy = 'alter',
+    liveTableKeys?: ReadonlySet<string>,
+    tableOwnedStatements?: ReadonlyMap<string, TableOwnedStatements>
   ): Promise<MigrationPlanPhases> {
     if (isSchemaRef(result.ref)) {
       if (result.status === 'missingLocal') {
@@ -350,46 +383,96 @@ export class SchemaDiffService {
     }
 
     if (result.status === 'missingLocal') {
-      return createMigrationPlanPhases({
-        other: [this.postgresSchemaService.getDropObjectSql(result.ref).trim()]
-      });
+      const phases = createMigrationPlanPhases();
+      getDropObjectPhase(phases, result.ref.kind).push(this.postgresSchemaService.getDropObjectSql(result.ref).trim());
+      return phases;
     }
 
     const localUri = result.localUri ?? this.schemaFileService.getLocalObjectUri(result.ref);
     const sql = await this.schemaFileService.readLocalFile(localUri);
 
-    if (!normalizeSql(sql)) {
+    if (!normalizeSqlForComparison(sql)) {
       throw new Error(`Local file for ${result.ref.schema}.${result.ref.name} is empty.`);
     }
 
     if (result.status === 'localOnly' && result.ref.kind === 'table') {
-      return createNewTableMigrationPlanPhases(result.ref, sql, localTables);
-    }
-
-    if (result.status === 'localOnly' && (result.ref.kind === 'type' || result.ref.kind === 'sequence')) {
-      return createMigrationPlanPhases({
-        prerequisites: [sql.trim()]
-      });
+      return createNewTableMigrationPlanPhases(result.ref, stripSqlComments(sql), localTables);
     }
 
     if (result.status === 'modified' && result.ref.kind === 'table') {
+      if (tableStrategy === 'recreate') {
+        const tableDefinitions = localTables ?? await this.getLocalTableDefinitions();
+        const existingTableKeys = liveTableKeys ?? new Set((await this.postgresSchemaService.listSchemaObjects())
+          .filter((object) => object.kind === 'table')
+          .map((object) => getTableDefinitionKey(object.schema, object.name)));
+        const associatedStatements = tableOwnedStatements ?? await this.getLocalTableOwnedStatements(tableDefinitions);
+        const phases = createNewTableMigrationPlanPhases(result.ref, stripSqlComments(sql), tableDefinitions);
+        const owned = associatedStatements.get(getTableDefinitionKey(result.ref.schema, result.ref.name));
+        phases.createIndexes.push(...(owned?.indexes ?? []));
+        phases.createTriggers.push(...(owned?.triggers ?? []));
+        phases.dropTables.push(
+          '-- WARNING: Recreating this table removes its rows, privileges, comments, and table-owned objects not restored below. Review this plan before running it.',
+          this.postgresSchemaService.getDropObjectSql(result.ref).trim()
+        );
+        appendReferencingForeignKeyRebuilds(result.ref, phases, tableDefinitions, existingTableKeys);
+        return phases;
+      }
+
       const liveDefinition = await this.postgresSchemaService.getObjectDefinition(result.ref);
-      return createTableMigrationPlanPhases(result.ref, liveDefinition.ddl, sql, localTables);
+      return createTableMigrationPlanPhases(result.ref, liveDefinition.ddl, stripSqlComments(sql), localTables);
     }
 
-    if (result.status === 'modified') {
+    if (result.status === 'modified' && result.ref.kind === 'sequence') {
       return createMigrationPlanPhases({
-        other: [stripTransactionWrapper(this.postgresSchemaService.getSqlReplacingObject(result.ref, sql)).trim()]
+        alterSequences: [createAlterSequenceStatement(sql)]
       });
     }
 
-    return createMigrationPlanPhases({
-      other: [ensureRoutineTerminator(result.ref, sql).trim()]
-    });
+    if (result.status === 'localOnly' && result.ref.kind === 'sequence') {
+      try {
+        const liveDefinition = await this.postgresSchemaService.getObjectDefinition(result.ref);
+        return areDefinitionsEquivalent(result.ref, liveDefinition.ddl, sql)
+          ? createMigrationPlanPhases()
+          : createMigrationPlanPhases({ alterSequences: [createAlterSequenceStatement(sql)] });
+      } catch (error) {
+        if (!isObjectNotFoundError(error)) {
+          throw error;
+        }
+      }
+    }
+
+    if (result.status === 'same') {
+      return createMigrationPlanPhases();
+    }
+
+    const phases = createMigrationPlanPhases();
+
+    if (result.status === 'modified' && requiresDropBeforeCreate(result.ref.kind)) {
+      getDropObjectPhase(phases, result.ref.kind).push(this.postgresSchemaService.getDropObjectSql(result.ref).trim());
+    }
+
+    getCreateObjectPhase(
+      phases,
+      result.ref.kind,
+      result.status === 'modified' && requiresDropBeforeCreate(result.ref.kind)
+    ).push(createExecutableObjectSql(result.ref, sql));
+    return phases;
   }
 
-  private async getDatabaseMigrationPlanSqlForResults(results: readonly SchemaComparisonResult[]): Promise<string> {
+  private async getDatabaseMigrationPlanSqlForResults(
+    results: readonly SchemaComparisonResult[],
+    tableStrategy: TableMigrationStrategy = 'alter'
+  ): Promise<string> {
     const localTables = await this.getLocalTableDefinitions();
+    const hasModifiedTables = results.some((result) => result.status === 'modified' && result.ref.kind === 'table');
+    const tableOwnedStatements = tableStrategy === 'recreate' && hasModifiedTables
+      ? await this.getLocalTableOwnedStatements(localTables)
+      : undefined;
+    const liveTableKeys = tableStrategy === 'recreate' && hasModifiedTables
+      ? new Set((await this.postgresSchemaService.listSchemaObjects())
+        .filter((object) => object.kind === 'table')
+        .map((object) => getTableDefinitionKey(object.schema, object.name)))
+      : undefined;
     const tableOwnedObjectKeys = getTableOwnedObjectKeys(localTables);
     const actionableResults = results.filter((result) =>
       result.status !== 'error'
@@ -405,7 +488,7 @@ export class SchemaDiffService {
     for (const result of sortMigrationResultsByTableDependencies(actionableResults, localTables)) {
       appendMigrationPlanPhases(
         combined,
-        await this.getDatabaseMigrationPlanPhases(result, localTables),
+        await this.getDatabaseMigrationPlanPhases(result, localTables, tableStrategy, liveTableKeys, tableOwnedStatements),
         `-- ${result.ref.schema}.${result.ref.name} (${result.ref.kind}, ${result.status})`
       );
     }
@@ -443,7 +526,7 @@ export class SchemaDiffService {
 
       try {
         tables.set(getTableDefinitionKey(localObject.schema, localObject.name), {
-          ...parseCreateTableDefinition(localSql),
+          ...parseCreateTableDefinition(stripSqlComments(localSql)),
           ref: localObject
         });
       } catch {
@@ -452,6 +535,33 @@ export class SchemaDiffService {
     }
 
     return tables;
+  }
+
+  private async getLocalTableOwnedStatements(
+    localTables: ReadonlyMap<string, ParsedTableDefinition>
+  ): Promise<ReadonlyMap<string, TableOwnedStatements>> {
+    const statements = new Map<string, TableOwnedStatements>();
+    const constraintBackedObjectKeys = getTableOwnedObjectKeys(localTables);
+
+    for (const object of await this.schemaFileService.listLocalObjects()) {
+      if ((object.kind !== 'index' && object.kind !== 'trigger') || constraintBackedObjectKeys.has(getLocalFileObjectKey(object))) {
+        continue;
+      }
+
+      const sql = await this.schemaFileService.tryReadLocalFile(this.schemaFileService.getLocalObjectUri(object));
+      if (!sql) {
+        continue;
+      }
+
+      const relation = getCreatedObjectRelation(sql, object);
+      const key = getTableDefinitionKey(relation.schema ?? object.schema, relation.table);
+      const owned = statements.get(key) ?? { indexes: [], triggers: [] };
+      const executableSql = createExecutableObjectSql(object, sql);
+      (object.kind === 'index' ? owned.indexes : owned.triggers).push(executableSql);
+      statements.set(key, owned);
+    }
+
+    return statements;
   }
 
   private async getIgnoredLocalOnlyObjectKeys(): Promise<ReadonlySet<string>> {
@@ -514,7 +624,7 @@ export async function getTableOwnedLocalObjectKeys(
 
     try {
       localTables.set(getTableDefinitionKey(localObject.schema, localObject.name), {
-        ...parseCreateTableDefinition(localSql),
+        ...parseCreateTableDefinition(stripSqlComments(localSql)),
         ref: localObject
       });
     } catch {
@@ -700,30 +810,26 @@ function getLocalFileObjectKey(ref: SchemaObjectRef): string {
   return `${ref.kind}:${ref.schema}.${ref.name}`;
 }
 
-function normalizeSql(sql: string): string {
-  return sql.replace(/\r\n/g, '\n').trim();
-}
-
 function ensureTrailingNewline(value: string): string {
   return value.endsWith('\n') ? value : `${value}\n`;
 }
 
 export function areDefinitionsEquivalent(ref: SchemaObjectRef, liveSql: string, localSql: string): boolean {
   if (ref.kind !== 'table') {
-    return normalizeSql(liveSql) === normalizeSql(localSql);
+    return normalizeSqlForComparison(liveSql) === normalizeSqlForComparison(localSql);
   }
 
   try {
-    return areTableDefinitionsEquivalent(liveSql, localSql);
+    return areTableDefinitionsEquivalent(stripSqlComments(liveSql), stripSqlComments(localSql));
   } catch {
-    return normalizeSql(liveSql) === normalizeSql(localSql);
+    return normalizeSqlForComparison(liveSql) === normalizeSqlForComparison(localSql);
   }
 }
 
 export function describeDefinitionChanges(ref: SchemaObjectRef, liveSql: string, localSql: string): string {
   if (ref.kind === 'table') {
     try {
-      return describeTableDefinitionChanges(liveSql, localSql);
+      return describeTableDefinitionChanges(stripSqlComments(liveSql), stripSqlComments(localSql));
     } catch {
       return describeSqlLineChanges(liveSql, localSql);
     }
@@ -766,15 +872,34 @@ interface ForeignKeyReference {
 }
 
 interface MigrationPlanPhases {
+  readonly dropTriggers: string[];
+  readonly dropViews: string[];
+  readonly dropIndexes: string[];
+  readonly dropRoutines: string[];
   readonly createSchemas: string[];
-  readonly prerequisites: string[];
   readonly dropForeignKeys: string[];
   readonly dropPrimaryUniqueCheckConstraints: string[];
   readonly alterColumns: string[];
+  readonly dropTables: string[];
+  readonly dropSequences: string[];
+  readonly dropTypes: string[];
+  readonly createTypes: string[];
+  readonly recreateTypes: string[];
+  readonly createSequences: string[];
+  readonly alterSequences: string[];
   readonly createTables: string[];
   readonly addPrimaryUniqueCheckConstraints: string[];
   readonly addForeignKeys: string[];
+  readonly createRoutines: string[];
+  readonly createIndexes: string[];
+  readonly createViews: string[];
+  readonly createTriggers: string[];
   readonly other: string[];
+}
+
+interface TableOwnedStatements {
+  readonly indexes: string[];
+  readonly triggers: string[];
 }
 
 function areTableDefinitionsEquivalent(liveSql: string, localSql: string): boolean {
@@ -884,8 +1009,8 @@ function describeColumnChanges(liveColumn: ParsedColumn, localColumn: ParsedColu
 }
 
 function describeSqlLineChanges(liveSql: string, localSql: string): string {
-  const liveLines = normalizeSql(liveSql).split('\n');
-  const localLines = normalizeSql(localSql).split('\n');
+  const liveLines = normalizeSqlForComparison(liveSql).split('\n');
+  const localLines = normalizeSqlForComparison(localSql).split('\n');
   const maxLength = Math.max(liveLines.length, localLines.length);
 
   for (let index = 0; index < maxLength; index += 1) {
@@ -946,7 +1071,7 @@ function createNewTableMigrationPlanPhases(
   const tableName = getQualifiedName(ref);
 
   return createMigrationPlanPhases({
-    createTables: [createTableSql],
+    createTables: [ensureSqlStatementTerminator(createTableSql)],
     addForeignKeys: foreignKeys.flatMap((constraint) =>
       createAddConstraintStatements(ref, tableName, constraint.name, constraint, localTables)
     )
@@ -1054,7 +1179,8 @@ function hasReferencedKeyConstraintChanges(liveTable: ParsedTableDefinition, loc
 function appendReferencingForeignKeyRebuilds(
   ref: SchemaObjectRef,
   phases: MigrationPlanPhases,
-  localTables: ReadonlyMap<string, ParsedTableDefinition> | undefined
+  localTables: ReadonlyMap<string, ParsedTableDefinition> | undefined,
+  liveTableKeys?: ReadonlySet<string>
 ): void {
   if (!localTables) {
     return;
@@ -1062,6 +1188,10 @@ function appendReferencingForeignKeyRebuilds(
 
   for (const [tableKey, table] of localTables) {
     if (tableKey === getTableDefinitionKey(ref.schema, ref.name)) {
+      continue;
+    }
+
+    if (liveTableKeys && !liveTableKeys.has(tableKey)) {
       continue;
     }
 
@@ -1149,27 +1279,55 @@ function doesConstraintUseAnyColumn(constraint: ParsedConstraint, columnNames: R
 
 function createMigrationPlanPhases(values?: Partial<MigrationPlanPhases>): MigrationPlanPhases {
   return {
+    dropTriggers: values?.dropTriggers ?? [],
+    dropViews: values?.dropViews ?? [],
+    dropIndexes: values?.dropIndexes ?? [],
+    dropRoutines: values?.dropRoutines ?? [],
     createSchemas: values?.createSchemas ?? [],
-    prerequisites: values?.prerequisites ?? [],
     dropForeignKeys: values?.dropForeignKeys ?? [],
     dropPrimaryUniqueCheckConstraints: values?.dropPrimaryUniqueCheckConstraints ?? [],
     alterColumns: values?.alterColumns ?? [],
+    dropTables: values?.dropTables ?? [],
+    dropSequences: values?.dropSequences ?? [],
+    dropTypes: values?.dropTypes ?? [],
+    createTypes: values?.createTypes ?? [],
+    recreateTypes: values?.recreateTypes ?? [],
+    createSequences: values?.createSequences ?? [],
+    alterSequences: values?.alterSequences ?? [],
     createTables: values?.createTables ?? [],
     addPrimaryUniqueCheckConstraints: values?.addPrimaryUniqueCheckConstraints ?? [],
     addForeignKeys: values?.addForeignKeys ?? [],
+    createRoutines: values?.createRoutines ?? [],
+    createIndexes: values?.createIndexes ?? [],
+    createViews: values?.createViews ?? [],
+    createTriggers: values?.createTriggers ?? [],
     other: values?.other ?? []
   };
 }
 
 function appendMigrationPlanPhases(target: MigrationPlanPhases, source: MigrationPlanPhases, comment: string): void {
+  appendPhase(target.dropTriggers, source.dropTriggers, comment);
+  appendPhase(target.dropViews, source.dropViews, comment);
+  appendPhase(target.dropIndexes, source.dropIndexes, comment);
+  appendPhase(target.dropRoutines, source.dropRoutines, comment);
   appendPhase(target.createSchemas, source.createSchemas, comment);
-  appendPhase(target.prerequisites, source.prerequisites, comment);
   appendPhase(target.dropForeignKeys, source.dropForeignKeys, comment);
   appendPhase(target.dropPrimaryUniqueCheckConstraints, source.dropPrimaryUniqueCheckConstraints, comment);
   appendPhase(target.alterColumns, source.alterColumns, comment);
+  appendPhase(target.dropTables, source.dropTables, comment);
+  appendPhase(target.dropSequences, source.dropSequences, comment);
+  appendPhase(target.dropTypes, source.dropTypes, comment);
+  appendPhase(target.createTypes, source.createTypes, comment);
+  appendPhase(target.recreateTypes, source.recreateTypes, comment);
+  appendPhase(target.createSequences, source.createSequences, comment);
+  appendPhase(target.alterSequences, source.alterSequences, comment);
   appendPhase(target.createTables, source.createTables, comment);
   appendPhase(target.addPrimaryUniqueCheckConstraints, source.addPrimaryUniqueCheckConstraints, comment);
   appendPhase(target.addForeignKeys, source.addForeignKeys, comment);
+  appendPhase(target.createRoutines, source.createRoutines, comment);
+  appendPhase(target.createIndexes, source.createIndexes, comment);
+  appendPhase(target.createViews, source.createViews, comment);
+  appendPhase(target.createTriggers, source.createTriggers, comment);
   appendPhase(target.other, source.other, comment);
 }
 
@@ -1197,14 +1355,28 @@ function formatMigrationPlanPhases(phases: MigrationPlanPhases, wrapTransaction:
 
 function getMigrationPlanStatements(phases: MigrationPlanPhases): string[] {
   return [
-    ...withPhaseHeader('1. Create schemas', uniqueStatements(phases.createSchemas)),
-    ...withPhaseHeader('2. Create prerequisite types and sequences', phases.prerequisites),
-    ...withPhaseHeader('3. Drop foreign keys', phases.dropForeignKeys),
-    ...withPhaseHeader('4. Drop primary/unique/check constraints', phases.dropPrimaryUniqueCheckConstraints),
-    ...withPhaseHeader('5. Drop/alter/add columns', phases.alterColumns),
-    ...withPhaseHeader('6. Create tables', phases.createTables),
-    ...withPhaseHeader('7. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
-    ...withPhaseHeader('8. Add foreign keys', phases.addForeignKeys),
+    ...withPhaseHeader('1. Drop dependent triggers', phases.dropTriggers),
+    ...withPhaseHeader('2. Drop dependent views', phases.dropViews),
+    ...withPhaseHeader('3. Drop dependent indexes', phases.dropIndexes),
+    ...withPhaseHeader('4. Drop dependent routines', phases.dropRoutines),
+    ...withPhaseHeader('5. Drop foreign keys', phases.dropForeignKeys),
+    ...withPhaseHeader('6. Drop primary/unique/check constraints', phases.dropPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('7. Create schemas', uniqueStatements(phases.createSchemas)),
+    ...withPhaseHeader('8. Create prerequisite types', phases.createTypes),
+    ...withPhaseHeader('9. Create prerequisite sequences', phases.createSequences),
+    ...withPhaseHeader('10. Alter sequences', phases.alterSequences),
+    ...withPhaseHeader('11. Drop/alter/add columns', phases.alterColumns),
+    ...withPhaseHeader('12. Drop tables', phases.dropTables),
+    ...withPhaseHeader('13. Drop sequences', phases.dropSequences),
+    ...withPhaseHeader('14. Drop types', phases.dropTypes),
+    ...withPhaseHeader('15. Recreate changed types', phases.recreateTypes),
+    ...withPhaseHeader('16. Create tables', phases.createTables),
+    ...withPhaseHeader('17. Add primary/unique/check constraints', phases.addPrimaryUniqueCheckConstraints),
+    ...withPhaseHeader('18. Add foreign keys', uniqueStatements(phases.addForeignKeys)),
+    ...withPhaseHeader('19. Create or replace routines', phases.createRoutines),
+    ...withPhaseHeader('20. Create indexes', uniqueStatements(phases.createIndexes)),
+    ...withPhaseHeader('21. Create views', phases.createViews),
+    ...withPhaseHeader('22. Create triggers', uniqueStatements(phases.createTriggers)),
     ...withPhaseHeader('Other object changes', phases.other)
   ];
 }
@@ -1239,6 +1411,82 @@ function getAddConstraintPhase(phases: MigrationPlanPhases, constraint: ParsedCo
   }
 
   return phases.other;
+}
+
+function getDropObjectPhase(phases: MigrationPlanPhases, kind: SchemaObjectKind): string[] {
+  switch (kind) {
+    case 'trigger':
+      return phases.dropTriggers;
+    case 'view':
+    case 'materializedView':
+      return phases.dropViews;
+    case 'index':
+      return phases.dropIndexes;
+    case 'function':
+    case 'procedure':
+      return phases.dropRoutines;
+    case 'table':
+      return phases.dropTables;
+    case 'sequence':
+      return phases.dropSequences;
+    case 'type':
+      return phases.dropTypes;
+  }
+}
+
+function getCreateObjectPhase(phases: MigrationPlanPhases, kind: SchemaObjectKind, replacing: boolean): string[] {
+  switch (kind) {
+    case 'type':
+      return replacing ? phases.recreateTypes : phases.createTypes;
+    case 'sequence':
+      return phases.createSequences;
+    case 'table':
+      return phases.createTables;
+    case 'function':
+    case 'procedure':
+      return phases.createRoutines;
+    case 'index':
+      return phases.createIndexes;
+    case 'view':
+    case 'materializedView':
+      return phases.createViews;
+    case 'trigger':
+      return phases.createTriggers;
+  }
+}
+
+function requiresDropBeforeCreate(kind: SchemaObjectKind): boolean {
+  return kind === 'type' || kind === 'index' || kind === 'materializedView' || kind === 'trigger';
+}
+
+function createExecutableObjectSql(ref: SchemaObjectRef, sql: string): string {
+  let executableSql = stripSqlComments(sql).trim();
+
+  if (ref.kind === 'function') {
+    executableSql = addOrReplaceClause(executableSql, 'FUNCTION');
+  } else if (ref.kind === 'procedure') {
+    executableSql = addOrReplaceClause(executableSql, 'PROCEDURE');
+  } else if (ref.kind === 'view') {
+    executableSql = addOrReplaceClause(executableSql, 'VIEW');
+  }
+
+  return ensureSqlStatementTerminator(executableSql).trim();
+}
+
+function addOrReplaceClause(sql: string, objectKeyword: 'FUNCTION' | 'PROCEDURE' | 'VIEW'): string {
+  const createPattern = new RegExp(`^CREATE\\s+(?!OR\\s+REPLACE\\s+)${objectKeyword}\\b`, 'i');
+  return sql.replace(createPattern, `CREATE OR REPLACE ${objectKeyword}`);
+}
+
+function createAlterSequenceStatement(sql: string): string {
+  const createSequencePattern = /^CREATE\s+(?:(?:TEMPORARY|TEMP|UNLOGGED)\s+)?SEQUENCE\s+(?:IF\s+NOT\s+EXISTS\s+)?/i;
+  const createSql = stripSqlComments(sql).trim().replace(/;+\s*$/, '');
+
+  if (!createSequencePattern.test(createSql)) {
+    throw new Error('Could not prepare sequence migration: expected a CREATE SEQUENCE statement.');
+  }
+
+  return ensureSqlStatementTerminator(createSql.replace(createSequencePattern, 'ALTER SEQUENCE ')).trim();
 }
 
 function createAddConstraintStatements(
@@ -1306,23 +1554,6 @@ function getConstraintKind(definition: string): ParsedConstraintKind {
   }
 
   return 'other';
-}
-
-function stripTransactionWrapper(sql: string): string {
-  return sql
-    .trim()
-    .replace(/^BEGIN\s*;\s*/i, '')
-    .replace(/\s*COMMIT\s*;\s*$/i, '')
-    .trim();
-}
-
-function ensureRoutineTerminator(ref: SchemaObjectRef, sql: string): string {
-  if (ref.kind !== 'function' && ref.kind !== 'procedure') {
-    return sql;
-  }
-
-  const trimmed = sql.trimEnd();
-  return trimmed.endsWith(';') ? trimmed : `${trimmed};`;
 }
 
 function parseCreateTableDefinition(sql: string): ParsedTableDefinition {
@@ -1485,6 +1716,25 @@ function readQualifiedRelationName(value: string): { readonly schema?: string; r
   };
 }
 
+function getCreatedObjectRelation(sql: string, ref: SchemaObjectRef): { readonly schema?: string; readonly table: string } {
+  const source = stripSqlComments(sql).trimStart();
+  if (ref.kind === 'index' && /^CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\b/i.test(source)) {
+    throw new Error(`Local index ${ref.schema}.${ref.name} uses CONCURRENTLY, which cannot run inside the table recreation transaction.`);
+  }
+
+  const expectedCreate = ref.kind === 'index'
+    ? /^CREATE\s+(?:UNIQUE\s+)?INDEX\b/i
+    : /^CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\b/i;
+  const onIndex = expectedCreate.test(source) ? findTopLevelKeyword(source, 'ON') : undefined;
+
+  if (onIndex === undefined) {
+    throw new Error(`Cannot identify the table for local ${ref.kind} ${ref.schema}.${ref.name} while preparing table recreation.`);
+  }
+
+  const afterOn = source.slice(onIndex + 'ON'.length).trimStart().replace(/^ONLY\b\s*/i, '');
+  return readQualifiedRelationName(afterOn);
+}
+
 function splitTopLevelComma(value: string): string[] {
   const parts: string[] = [];
   let startIndex = 0;
@@ -1607,7 +1857,7 @@ function readIdentifier(value: string): { readonly value: string; readonly endIn
     throw new Error('Expected closing quote for SQL identifier.');
   }
 
-  const match = /^[^\s,()]+/.exec(value.slice(trimmedStart));
+  const match = /^[^\s,.()]+/.exec(value.slice(trimmedStart));
 
   if (!match) {
     throw new Error('Expected SQL identifier.');

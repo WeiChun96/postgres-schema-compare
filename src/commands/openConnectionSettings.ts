@@ -141,18 +141,8 @@ async function chooseSchemaFolder(webview: vscode.Webview | undefined): Promise<
 
   await webview?.postMessage({
     type: 'schemaFolderSelected',
-    schemaFolder: toWorkspaceRelativePath(selectedFolder)
+    schemaFolder: selectedFolder.fsPath
   });
-}
-
-function toWorkspaceRelativePath(folderUri: vscode.Uri): string {
-  const workspaceFolder = vscode.workspace.getWorkspaceFolder(folderUri);
-
-  if (!workspaceFolder) {
-    return folderUri.fsPath;
-  }
-
-  return vscode.workspace.asRelativePath(folderUri, false);
 }
 
 async function testConnection(webview: vscode.Webview | undefined, message: TestConnectionSettingsMessage): Promise<void> {
@@ -515,8 +505,8 @@ function renderConnectionSettingsHtml(config: ExtensionConfig): string {
               </svg>
             </button>
           </span>
-          <input id="schemaFolder" name="schemaFolder" type="text" value="${escapeAttribute(config.schemaFolder)}" placeholder="schema">
-          <span class="hint">Use a workspace-relative path when the folder is inside the current workspace.</span>
+          <input id="schemaFolder" name="schemaFolder" type="text" value="${escapeAttribute(config.schemaFolder)}" placeholder="C:\\path\\to\\schema">
+          <span class="hint">Choosing a folder fills in its full path.</span>
         </label>
       </fieldset>
 

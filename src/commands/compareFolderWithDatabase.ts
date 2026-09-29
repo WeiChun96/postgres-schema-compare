@@ -1,18 +1,18 @@
 import * as vscode from 'vscode';
 import { DiffSessionState } from '../services/diffSessionState';
-import { isSchemaRef, SchemaComparisonRef, SchemaComparisonResult, SchemaComparisonStatus, SchemaDiffService } from '../services/schemaDiffService';
+import { isSchemaRef, SchemaComparisonRef, SchemaComparisonResult, SchemaComparisonStatus, SchemaDiffService, TableMigrationStrategy } from '../services/schemaDiffService';
 import { ServiceFactory } from '../services/serviceFactory';
 import { SchemaObjectRef } from '../model/schemaObject';
 
 type FilterableComparisonStatus = Extract<SchemaComparisonStatus, 'modified' | 'missingLocal' | 'localOnly'>;
 
 type RowComparisonMessage = {
-  readonly type: 'openDiff' | 'updateFolder' | 'updateDatabase' | 'showMigrationPlan';
+  readonly type: 'openDiff' | 'updateFolder' | 'updateDatabase' | 'showMigrationPlan' | 'showRecreatePlan' | 'updateDatabaseRecreate';
   readonly id: string;
 };
 
 type BulkComparisonMessage = {
-  readonly type: 'bulkUpdateFolder' | 'bulkMigrationPlan' | 'bulkUpdateDatabase';
+  readonly type: 'bulkUpdateFolder' | 'bulkMigrationPlan' | 'bulkUpdateDatabase' | 'bulkRecreatePlan' | 'bulkUpdateDatabaseRecreate';
   readonly status?: FilterableComparisonStatus;
   readonly schema?: string;
   readonly kind?: SchemaComparisonRef['kind'];
@@ -41,7 +41,8 @@ export function registerCompareFolderWithDatabaseCommand(
           'Schema Folder vs Database',
           vscode.ViewColumn.One,
           {
-            enableScripts: true
+            enableScripts: true,
+            retainContextWhenHidden: true
           }
         );
 
@@ -55,13 +56,15 @@ export function registerCompareFolderWithDatabaseCommand(
                 return;
               }
 
-              if (message.type === 'bulkMigrationPlan') {
-                await openAllDatabaseMigrationPlan(diffService, resultById, message.status, message.schema, message.kind);
+              if (message.type === 'bulkMigrationPlan' || message.type === 'bulkRecreatePlan') {
+                await openAllDatabaseMigrationPlan(diffService, resultById, message.status, message.schema, message.kind,
+                  message.type === 'bulkRecreatePlan' ? 'recreate' : 'alter');
                 return;
               }
 
-              if (message.type === 'bulkUpdateDatabase') {
-                await updateAllDatabaseDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema, message.kind);
+              if (message.type === 'bulkUpdateDatabase' || message.type === 'bulkUpdateDatabaseRecreate') {
+                await updateAllDatabaseDifferences(panel.webview, diffService, resultById, onSynced, message.status, message.schema, message.kind,
+                  message.type === 'bulkUpdateDatabaseRecreate' ? 'recreate' : 'alter');
                 return;
               }
 
@@ -84,18 +87,32 @@ export function registerCompareFolderWithDatabaseCommand(
                 return;
               }
 
-              if (message.type === 'updateDatabase') {
-                const didSync = await updateDatabaseFromResult(diffService, result);
+              if (message.type === 'updateDatabase' || message.type === 'updateDatabaseRecreate') {
+                if (message.type === 'updateDatabaseRecreate' && !isModifiedTable(result)) {
+                  return;
+                }
+
+                const didSync = await updateDatabaseFromResult(diffService, result,
+                  message.type === 'updateDatabaseRecreate' ? 'recreate' : 'alter');
 
                 if (didSync) {
-                  await refreshComparisonView(panel.webview, resultById, [result.ref], onSynced);
+                  if (message.type === 'updateDatabaseRecreate') {
+                    await reloadComparisonView(panel.webview, diffService, resultById, [result.ref], onSynced);
+                  } else {
+                    await refreshComparisonView(panel.webview, resultById, [result.ref], onSynced);
+                  }
                 }
 
                 return;
               }
 
-              if (message.type === 'showMigrationPlan') {
-                await openDatabaseMigrationPlan(diffService, result);
+              if (message.type === 'showMigrationPlan' || message.type === 'showRecreatePlan') {
+                if (message.type === 'showRecreatePlan' && !isModifiedTable(result)) {
+                  return;
+                }
+
+                await openDatabaseMigrationPlan(diffService, result,
+                  message.type === 'showRecreatePlan' ? 'recreate' : 'alter');
                 return;
               }
 
@@ -305,7 +322,7 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
     }
 
     main {
-      max-width: 1100px;
+      width: 100%;
     }
 
     header {
@@ -424,12 +441,20 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
 
     table {
       border-collapse: collapse;
+      min-width: 100%;
+      table-layout: fixed;
       width: 100%;
+    }
+
+    .table-scroll {
+      max-width: 100%;
+      overflow-x: auto;
     }
 
     th {
       color: var(--vscode-descriptionForeground);
       font-weight: 600;
+      position: relative;
       text-align: left;
     }
 
@@ -438,6 +463,53 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
       border-bottom: 1px solid var(--vscode-panel-border);
       padding: 8px 10px;
       vertical-align: top;
+      white-space: nowrap;
+    }
+
+    td {
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    th {
+      padding-right: 20px;
+    }
+
+    .resize-handle {
+      background: transparent;
+      border: 0;
+      bottom: 0;
+      cursor: col-resize;
+      padding: 0;
+      position: absolute;
+      right: 0;
+      top: 0;
+      touch-action: none;
+      width: 10px;
+    }
+
+    .resize-handle::after {
+      border-left: 1px solid var(--vscode-panel-border);
+      content: '';
+      height: 60%;
+      left: 4px;
+      position: absolute;
+      top: 20%;
+    }
+
+    .resize-handle:hover,
+    .resize-handle:focus-visible {
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+
+    .resize-handle:hover::after,
+    .resize-handle:focus-visible::after {
+      border-color: var(--vscode-focusBorder);
+    }
+
+    body.resizing {
+      cursor: col-resize;
+      user-select: none;
     }
 
     tr.modified {
@@ -484,7 +556,6 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
 
     .object {
       font-family: var(--vscode-editor-font-family);
-      overflow-wrap: anywhere;
     }
 
     .kind,
@@ -524,10 +595,29 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
     }
 
     .actions {
-      align-items: center;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
+      background: var(--vscode-editor-background);
+      box-shadow: -1px 0 var(--vscode-panel-border);
+      position: sticky;
+      right: 0;
+      white-space: nowrap;
+      z-index: 1;
+    }
+
+    th:last-child {
+      background: var(--vscode-editor-background);
+      box-shadow: -1px 0 var(--vscode-panel-border);
+      position: sticky;
+      right: 0;
+      z-index: 2;
+    }
+
+    .actions select {
+      min-width: 0;
+      width: calc(100% - 60px);
+    }
+
+    .actions button {
+      margin-left: 6px;
     }
 
     .bulk-actions {
@@ -637,20 +727,23 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
       </div>
     </header>
 
-    ${hasResults ? `<table>
+    ${hasResults ? `<div class="table-scroll"><table>
+      <colgroup>
+        <col><col><col><col><col>
+      </colgroup>
       <thead>
         <tr>
-          <th>Status</th>
-          <th>Object</th>
-          <th>Type</th>
-          <th>Detail</th>
-          <th>Action</th>
+          <th>Status<button class="resize-handle" type="button" data-resize-column="0" role="separator" aria-orientation="vertical" aria-label="Resize Status column" aria-valuemin="110"></button></th>
+          <th>Object<button class="resize-handle" type="button" data-resize-column="1" role="separator" aria-orientation="vertical" aria-label="Resize Object column" aria-valuemin="160"></button></th>
+          <th>Type<button class="resize-handle" type="button" data-resize-column="2" role="separator" aria-orientation="vertical" aria-label="Resize Type column" aria-valuemin="100"></button></th>
+          <th>Detail<button class="resize-handle" type="button" data-resize-column="3" role="separator" aria-orientation="vertical" aria-label="Resize Detail column" aria-valuemin="160"></button></th>
+          <th>Action<button class="resize-handle" type="button" data-resize-column="4" role="separator" aria-orientation="vertical" aria-label="Resize Action column" aria-valuemin="300"></button></th>
         </tr>
       </thead>
       <tbody>
         ${rows}
       </tbody>
-    </table>
+    </table></div>
     <div id="filtered-empty-state" class="filtered-empty-state">No changes match the selected filter.</div>` : '<div class="empty-state">Schema folder matches the live database.</div>'}
   </main>
 
@@ -660,6 +753,10 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
     let activeFilter = savedFilterState.status;
     let activeSchema = savedFilterState.schema;
     let activeKind = savedFilterState.kind;
+
+    function saveViewState(changes) {
+      vscode.setState({ ...vscode.getState(), ...changes });
+    }
 
     function getVisibleRows() {
       return Array.from(document.querySelectorAll('tbody tr[data-id]')).filter((row) => !row.hidden);
@@ -673,7 +770,18 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
         return;
       }
 
-      const hasVisibleActionableRows = getVisibleRows().some((row) => row.dataset.status !== 'error');
+      const visibleRows = getVisibleRows();
+      const hasVisibleActionableRows = visibleRows.some((row) => row.dataset.status !== 'error');
+      const hasModifiedTable = visibleRows.some((row) => row.dataset.status === 'modified' && row.dataset.kind === 'table');
+      for (const value of ['bulkRecreatePlan', 'bulkUpdateDatabaseRecreate']) {
+        const option = Array.from(select.options).find((candidate) => candidate.value === value);
+        if (option) {
+          option.disabled = !hasModifiedTable;
+        }
+      }
+      if (select.selectedOptions[0]?.disabled) {
+        select.value = 'bulkMigrationPlan';
+      }
       select.disabled = !hasVisibleActionableRows;
       button.disabled = !hasVisibleActionableRows;
     }
@@ -744,10 +852,103 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
 
       updateFilterStatus();
       updateBulkActionState();
-      vscode.setState({
+      saveViewState({
         status: activeFilter,
         schema: activeSchema,
         kind: activeKind
+      });
+    }
+
+    const table = document.querySelector('.table-scroll table');
+    const tableScroll = document.querySelector('.table-scroll');
+    if (table && tableScroll) {
+      const columns = Array.from(table.querySelectorAll('col'));
+      const defaultWidths = [110, 250, 120, 350, 310];
+      const minimumWidths = [110, 160, 100, 160, 300];
+      const savedWidths = savedFilterState.columnWidths;
+      const columnWidths = defaultWidths.map((width, index) =>
+        Array.isArray(savedWidths) && Number.isFinite(savedWidths[index])
+          ? Math.max(minimumWidths[index], savedWidths[index])
+          : width
+      );
+
+      function setColumnWidth(index, width) {
+        columnWidths[index] = Math.max(minimumWidths[index], Math.round(width));
+        columns[index].style.width = columnWidths[index] + 'px';
+        table.style.width = columnWidths.reduce((total, current) => total + current, 0) + 'px';
+        table.querySelector('[data-resize-column="' + index + '"]')?.setAttribute('aria-valuenow', String(columnWidths[index]));
+      }
+
+      function syncRenderedWidths() {
+        const headers = table.querySelectorAll('th');
+        headers.forEach((header, index) => {
+          columnWidths[index] = Math.max(minimumWidths[index], Math.round(header.getBoundingClientRect().width));
+          columns[index].style.width = columnWidths[index] + 'px';
+        });
+        table.style.width = columnWidths.reduce((total, current) => total + current, 0) + 'px';
+      }
+
+      columnWidths.forEach((width, index) => setColumnWidth(index, width));
+
+      table.querySelectorAll('[data-resize-column]').forEach((handle) => {
+        const index = Number(handle.dataset.resizeColumn);
+        let drag;
+
+        handle.addEventListener('pointerdown', (event) => {
+          if (event.button !== 0) {
+            return;
+          }
+
+          event.preventDefault();
+          syncRenderedWidths();
+          drag = { pointerId: event.pointerId, startX: event.clientX, startWidth: columnWidths[index] };
+          handle.setPointerCapture(event.pointerId);
+          document.body.classList.add('resizing');
+        });
+
+        handle.addEventListener('pointermove', (event) => {
+          if (drag?.pointerId === event.pointerId) {
+            setColumnWidth(index, drag.startWidth + event.clientX - drag.startX);
+            if (index < columns.length - 1) {
+              const scrollBounds = tableScroll.getBoundingClientRect();
+              const handleBounds = handle.getBoundingClientRect();
+              const actionBounds = table.querySelector('th:last-child')?.getBoundingClientRect();
+              const rightEdge = Math.min(scrollBounds.right, actionBounds?.left ?? scrollBounds.right);
+              if (handleBounds.right > rightEdge - 12) {
+                tableScroll.scrollLeft += handleBounds.right - rightEdge + 12;
+              } else if (handleBounds.left < scrollBounds.left + 12) {
+                tableScroll.scrollLeft -= scrollBounds.left - handleBounds.left + 12;
+              }
+            }
+          }
+        });
+
+        function finishResize(event) {
+          if (drag?.pointerId !== event.pointerId) {
+            return;
+          }
+
+          drag = undefined;
+          document.body.classList.remove('resizing');
+          if (handle.hasPointerCapture(event.pointerId)) {
+            handle.releasePointerCapture(event.pointerId);
+          }
+          saveViewState({ columnWidths: [...columnWidths] });
+        }
+
+        handle.addEventListener('pointerup', finishResize);
+        handle.addEventListener('pointercancel', finishResize);
+        handle.addEventListener('lostpointercapture', finishResize);
+        handle.addEventListener('keydown', (event) => {
+          if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
+            return;
+          }
+
+          event.preventDefault();
+          syncRenderedWidths();
+          setColumnWidth(index, columnWidths[index] + (event.key === 'ArrowRight' ? 20 : -20));
+          saveViewState({ columnWidths: [...columnWidths] });
+        });
       });
     }
 
@@ -820,6 +1021,23 @@ function renderComparisonHtml(results: readonly SchemaComparisonResult[]): strin
     }
 
     applyFilters();
+    requestAnimationFrame(() => {
+      window.scrollTo(savedFilterState.scrollX || 0, savedFilterState.scrollY || 0);
+      if (tableScroll) {
+        tableScroll.scrollLeft = savedFilterState.tableScrollLeft || 0;
+      }
+
+      function saveScrollPosition() {
+        saveViewState({
+          scrollX: window.scrollX,
+          scrollY: window.scrollY,
+          tableScrollLeft: tableScroll?.scrollLeft || 0
+        });
+      }
+
+      window.addEventListener('scroll', saveScrollPosition, { passive: true });
+      tableScroll?.addEventListener('scroll', saveScrollPosition, { passive: true });
+    });
   </script>
 </body>
 </html>`;
@@ -830,12 +1048,13 @@ function renderResultRow(result: SchemaComparisonResult): string {
   const actionOptions = getActionOptions(result);
   const signature = !isSchemaRef(result.ref) && result.ref.identityArguments ? `(${result.ref.identityArguments})` : '';
   const objectLabel = isSchemaRef(result.ref) ? result.ref.schema : `${result.ref.schema}.${result.ref.name}${signature}`;
+  const detail = result.message ?? getStatusDetail(result.status);
 
   return `<tr class="${escapeAttribute(result.status)}" data-id="${escapeAttribute(id)}" data-status="${escapeAttribute(result.status)}" data-schema="${escapeAttribute(result.ref.schema)}" data-kind="${escapeAttribute(result.ref.kind)}">
     <td><span class="badge ${escapeAttribute(result.status)}">${escapeHtml(getStatusLabel(result.status))}</span></td>
-    <td class="object">${escapeHtml(objectLabel)}</td>
+    <td class="object" title="${escapeAttribute(objectLabel)}">${escapeHtml(objectLabel)}</td>
     <td class="kind">${escapeHtml(result.ref.kind)}</td>
-    <td class="detail">${escapeHtml(result.message ?? getStatusDetail(result.status))}</td>
+    <td class="detail" title="${escapeAttribute(detail)}">${escapeHtml(detail)}</td>
     <td class="actions">
       <select data-action-select data-id="${escapeAttribute(id)}"${actionOptions.length === 0 ? ' disabled' : ''}>
         ${actionOptions.length === 0 ? '<option value="">No available action</option>' : actionOptions.map(renderActionOption).join('')}
@@ -868,9 +1087,15 @@ function getActionOptions(result: SchemaComparisonResult): ReadonlyArray<{ reado
   return [
     { value: 'openDiff', label: 'Compare' },
     { value: 'showMigrationPlan', label: 'Migration Plan' },
+    ...(isModifiedTable(result) ? [{ value: 'showRecreatePlan' as const, label: 'Migration Plan — Drop and Recreate Table' }] : []),
     { value: 'updateFolder', label: 'Update Folder' },
-    { value: 'updateDatabase', label: 'Update Database' }
+    { value: 'updateDatabase', label: 'Update Database' },
+    ...(isModifiedTable(result) ? [{ value: 'updateDatabaseRecreate' as const, label: 'Update Database — Drop and Recreate Table' }] : [])
   ];
+}
+
+function isModifiedTable(result: SchemaComparisonResult): boolean {
+  return result.status === 'modified' && result.ref.kind === 'table';
 }
 
 function renderActionOption(option: { readonly value: RowComparisonMessage['type']; readonly label: string }): string {
@@ -886,8 +1111,14 @@ function getBulkActionOptions(results: readonly SchemaComparisonResult[]): Reado
 
   return [
     { value: 'bulkMigrationPlan', label: 'Migration Plan - All Differences' },
+    ...(results.some(isModifiedTable)
+      ? [{ value: 'bulkRecreatePlan' as const, label: 'Migration Plan - Recreate Modified Tables' }]
+      : []),
     { value: 'bulkUpdateFolder', label: 'Update Folder - All Differences' },
-    { value: 'bulkUpdateDatabase', label: 'Update Database - All Differences' }
+    { value: 'bulkUpdateDatabase', label: 'Update Database - All Differences' },
+    ...(results.some(isModifiedTable)
+      ? [{ value: 'bulkUpdateDatabaseRecreate' as const, label: 'Update Database - Recreate Modified Tables' }]
+      : [])
   ];
 }
 
@@ -903,7 +1134,8 @@ function renderBulkActionOptions(results: readonly SchemaComparisonResult[]): st
 
 async function updateFolderFromResult(
   diffService: SchemaDiffService,
-  result: SchemaComparisonResult
+  result: SchemaComparisonResult,
+  confirmChanges = true
 ): Promise<boolean> {
   if (isSchemaRef(result.ref)) {
     await vscode.window.showInformationMessage('Schema rows do not have a local SQL file to update.');
@@ -913,13 +1145,15 @@ async function updateFolderFromResult(
   const objectRef = result.ref;
 
   if (result.status === 'localOnly') {
-    const confirmed = await confirmAction(
-      `${objectRef.schema}.${objectRef.name} exists only in the folder. Delete the local file to match the live database?`,
-      'Delete Local File'
-    );
+    if (confirmChanges) {
+      const confirmed = await confirmAction(
+        `${objectRef.schema}.${objectRef.name} exists only in the folder. Delete the local file to match the live database?`,
+        'Delete Local File'
+      );
 
-    if (!confirmed) {
-      return false;
+      if (!confirmed) {
+        return false;
+      }
     }
 
     await runActionWithProgress(
@@ -929,7 +1163,7 @@ async function updateFolderFromResult(
     return true;
   }
 
-  if (result.status === 'missingLocal') {
+  if (result.status === 'missingLocal' && confirmChanges) {
     const confirmed = await confirmAction(
       `${objectRef.schema}.${objectRef.name} exists only in the live database. Create the local file to match the live database?`,
       'Create Local File'
@@ -949,12 +1183,19 @@ async function updateFolderFromResult(
 
 async function updateDatabaseFromResult(
   diffService: SchemaDiffService,
-  result: SchemaComparisonResult
+  result: SchemaComparisonResult,
+  tableStrategy: TableMigrationStrategy = 'alter'
 ): Promise<boolean> {
+  if (tableStrategy === 'recreate' && !isModifiedTable(result)) {
+    return false;
+  }
+
   const action = isSchemaRef(result.ref)
     ? 'Create Schema'
-    : result.status === 'missingLocal' ? 'Drop Database Object' : 'Update Database';
-  const message = getUpdateDatabaseConfirmationMessage(result);
+    : result.status === 'missingLocal' ? 'Drop Database Object' : tableStrategy === 'recreate' ? 'Drop and Recreate Table' : 'Update Database';
+  const message = tableStrategy === 'recreate'
+    ? `Drop and recreate ${result.ref.schema}.${result.ref.name} from local SQL? All rows, privileges, comments, and objects not restored by the plan will be lost. Review the plan first. External dependencies may block the drop; CASCADE is not used.`
+    : getUpdateDatabaseConfirmationMessage(result);
   const confirmed = await confirmAction(message, action);
 
   if (!confirmed) {
@@ -971,7 +1212,12 @@ async function updateDatabaseFromResult(
 
   const objectRef = result.ref;
 
-  if (result.status === 'missingLocal') {
+  if (tableStrategy === 'recreate') {
+    await runActionWithProgress(
+      `Dropping and recreating table ${objectRef.schema}.${objectRef.name}...`,
+      () => diffService.updateDatabaseFromMigrationPlan([result], 'recreate')
+    );
+  } else if (result.status === 'missingLocal') {
     await runActionWithProgress(
       `Dropping live database object ${objectRef.schema}.${objectRef.name}...`,
       () => diffService.dropDatabaseObject(objectRef)
@@ -995,15 +1241,26 @@ async function updateAllFolderDifferences(
   schema?: string,
   kind?: SchemaComparisonRef['kind']
 ): Promise<void> {
-  const results = getActionableResults(resultById, status, schema, kind);
+  const results = getActionableResults(resultById, status, schema, kind)
+    .filter((result): result is SchemaComparisonResult & { readonly ref: SchemaObjectRef } => !isSchemaRef(result.ref));
   const syncedRefs: SchemaObjectRef[] = [];
 
-  for (const result of results) {
-    if (isSchemaRef(result.ref)) {
-      continue;
-    }
+  if (results.length === 0) {
+    await vscode.window.showInformationMessage('There are no local schema files to update for this selection.');
+    return;
+  }
 
-    const didSync = await updateFolderFromResult(diffService, result);
+  const confirmed = await confirmAction(
+    `Update the folder for ${getBulkScopeLabel(status, schema, kind)}${results.length} difference(s)? Local-only files will be deleted and database-only files will be created.`,
+    'Update Folder'
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  for (const result of results) {
+    const didSync = await updateFolderFromResult(diffService, result, false);
 
     if (didSync) {
       syncedRefs.push(result.ref);
@@ -1022,14 +1279,22 @@ async function updateAllDatabaseDifferences(
   onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void,
   status?: FilterableComparisonStatus,
   schema?: string,
-  kind?: SchemaComparisonRef['kind']
+  kind?: SchemaComparisonRef['kind'],
+  tableStrategy: TableMigrationStrategy = 'alter'
 ): Promise<void> {
   const results = getActionableResults(resultById, status, schema, kind);
   const syncedRefs = results.map((result) => result.ref);
 
+  if (tableStrategy === 'recreate' && !results.some(isModifiedTable)) {
+    await vscode.window.showInformationMessage('No modified tables are in the current selection.');
+    return;
+  }
+
   const confirmed = await confirmAction(
-    `Apply the generated migration plan for ${getBulkScopeLabel(status, schema, kind)}${results.length} difference(s) to the live database?`,
-    'Update Database'
+    tableStrategy === 'recreate'
+      ? `Apply the migration plan for ${getBulkScopeLabel(status, schema, kind)}${results.length} difference(s), dropping and recreating modified tables? Their rows, privileges, comments, and objects not restored by the plan will be lost. Review the plan first. External dependencies may block a drop; CASCADE is not used.`
+      : `Apply the generated migration plan for ${getBulkScopeLabel(status, schema, kind)}${results.length} difference(s) to the live database?`,
+    tableStrategy === 'recreate' ? 'Recreate Modified Tables' : 'Update Database'
   );
 
   if (!confirmed) {
@@ -1038,10 +1303,14 @@ async function updateAllDatabaseDifferences(
 
   await runActionWithProgress(
     'Updating live database from full migration plan...',
-    () => diffService.updateDatabaseFromMigrationPlan(results)
+    () => diffService.updateDatabaseFromMigrationPlan(results, tableStrategy)
   );
 
-  await refreshComparisonView(webview, resultById, syncedRefs, onSynced);
+  if (tableStrategy === 'recreate') {
+    await reloadComparisonView(webview, diffService, resultById, syncedRefs, onSynced);
+  } else {
+    await refreshComparisonView(webview, resultById, syncedRefs, onSynced);
+  }
 }
 
 function getActionableResults(
@@ -1076,11 +1345,12 @@ function getUpdateDatabaseConfirmationMessage(result: SchemaComparisonResult): s
 
 async function openDatabaseMigrationPlan(
   diffService: SchemaDiffService,
-  result: SchemaComparisonResult
+  result: SchemaComparisonResult,
+  tableStrategy: TableMigrationStrategy = 'alter'
 ): Promise<void> {
   const uri = await runActionWithProgress(
     `Preparing database migration plan for ${result.ref.schema}.${result.ref.name}...`,
-    () => diffService.prepareDatabaseMigrationPlan(result)
+    () => diffService.prepareDatabaseMigrationPlan(result, tableStrategy)
   );
 
   await vscode.window.showTextDocument(uri, {
@@ -1094,12 +1364,18 @@ async function openAllDatabaseMigrationPlan(
   resultById: ReadonlyMap<string, SchemaComparisonResult>,
   status?: FilterableComparisonStatus,
   schema?: string,
-  kind?: SchemaComparisonRef['kind']
+  kind?: SchemaComparisonRef['kind'],
+  tableStrategy: TableMigrationStrategy = 'alter'
 ): Promise<void> {
   const results = getActionableResults(resultById, status, schema, kind);
+  if (tableStrategy === 'recreate' && !results.some(isModifiedTable)) {
+    await vscode.window.showInformationMessage('No modified tables are in the current selection.');
+    return;
+  }
+
   const uri = await runActionWithProgress(
     `Preparing ${getBulkScopeLabel(status, schema, kind).trim() || 'full'} database migration plan...`,
-    () => diffService.prepareDatabaseMigrationPlanForResults(results)
+    () => diffService.prepareDatabaseMigrationPlanForResults(results, tableStrategy)
   );
 
   await vscode.window.showTextDocument(uri, {
@@ -1120,6 +1396,25 @@ async function refreshComparisonView(
 
   webview.html = renderComparisonHtml(Array.from(resultById.values()));
 
+  await onSynced(syncedRefs);
+}
+
+async function reloadComparisonView(
+  webview: vscode.Webview,
+  diffService: SchemaDiffService,
+  resultById: Map<string, SchemaComparisonResult>,
+  syncedRefs: readonly SchemaComparisonRef[],
+  onSynced: (refs: readonly SchemaComparisonRef[]) => Promise<void> | void
+): Promise<void> {
+  const results = await diffService.compareFolderWithDatabase();
+  resultById.clear();
+  for (const result of results) {
+    if (result.status !== 'same') {
+      resultById.set(getResultId(result.ref), result);
+    }
+  }
+
+  webview.html = renderComparisonHtml(Array.from(resultById.values()));
   await onSynced(syncedRefs);
 }
 
