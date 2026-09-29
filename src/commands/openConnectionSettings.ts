@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { ExtensionConfig, getExtensionConfig, updateExtensionConfig } from '../config';
+import * as os from 'os';
+import { ExtensionConfig, getExtensionConfig, updateExtensionConfig, updateSchemaFolder } from '../config';
 import { PostgresSchemaService } from '../services/postgresSchemaService';
 
 type ConnectionSettingsMessage =
@@ -124,6 +125,7 @@ async function chooseSchemaFolder(webview: vscode.Webview | undefined): Promise<
     canSelectFiles: false,
     canSelectFolders: true,
     canSelectMany: false,
+    defaultUri: vscode.Uri.file(os.homedir()),
     openLabel: 'Select Schema Folder',
     title: 'Select Schema Folder'
   });
@@ -139,6 +141,7 @@ async function chooseSchemaFolder(webview: vscode.Webview | undefined): Promise<
     return;
   }
 
+  await updateSchemaFolder(selectedFolder.fsPath);
   await webview?.postMessage({
     type: 'schemaFolderSelected',
     schemaFolder: selectedFolder.fsPath
@@ -506,7 +509,7 @@ function renderConnectionSettingsHtml(config: ExtensionConfig): string {
             </button>
           </span>
           <input id="schemaFolder" name="schemaFolder" type="text" value="${escapeAttribute(config.schemaFolder)}" placeholder="C:\\path\\to\\schema">
-          <span class="hint">Choosing a folder fills in its full path.</span>
+          <span class="hint">Choosing a folder saves its full path immediately. You can also type a path and select Save Settings.</span>
         </label>
       </fieldset>
 
@@ -626,7 +629,7 @@ function renderConnectionSettingsHtml(config: ExtensionConfig): string {
 
       if (message.type === 'schemaFolderSelected') {
         schemaFolder.value = message.schemaFolder;
-        setStatus('Schema folder selected.', 'success');
+        setStatus('Schema folder selected and saved.', 'success');
         return;
       }
 

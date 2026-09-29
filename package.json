@@ -2,7 +2,7 @@
   "name": "postgres-schema-compare",
   "displayName": "PostgreSQL Schema Compare",
   "description": "Compare, review, and synchronize PostgreSQL schema objects with local SQL files.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "wcNeo96",
   "license": "MIT",
   "engines": {
@@ -18,6 +18,7 @@
   "icon": "logo.ico",
   "activationEvents": [
     "onCommand:postgresSchemaCompare.openConnectionSettings",
+    "onCommand:postgresSchemaCompare.removeConnection",
     "onCommand:postgresSchemaCompare.compareFileWithDatabase",
     "onCommand:postgresSchemaCompare.compareFolderWithDatabase",
     "onCommand:postgresSchemaCompare.compareDatabaseObjectWithFolder",
@@ -38,6 +39,12 @@
         "title": "Configure Connection",
         "category": "PostgreSQL Schema Compare",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "postgresSchemaCompare.removeConnection",
+        "title": "Remove Connection",
+        "category": "PostgreSQL Schema Compare",
+        "icon": "$(close)"
       },
       {
         "command": "postgresSchemaCompare.compareFileWithDatabase",
@@ -199,6 +206,11 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "postgresSchemaCompare.removeConnection",
+          "when": "view == postgresSchemaCompare.objects && (viewItem == postgresSchemaCompare.connection || viewItem == postgresSchemaCompare.connectionFailed)",
+          "group": "navigation@3"
+        },
         {
           "command": "postgresSchemaCompare.exportDatabaseToFolder",
           "when": "view == postgresSchemaCompare.objects && viewItem == postgresSchemaCompare.connection",

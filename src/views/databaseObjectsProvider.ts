@@ -105,6 +105,7 @@ export class DatabaseObjectsProvider implements vscode.TreeDataProvider<Database
   }
 
   public refresh(): void {
+    this.connectionCheckId += 1;
     this.connectionState = { status: 'idle' };
     this.schemaNodes.clear();
     this.folderNodes.clear();

@@ -27,8 +27,7 @@ export function hasConnectionConfig(config = getExtensionConfig()): boolean {
 }
 
 export async function updateExtensionConfig(config: ExtensionConfig): Promise<void> {
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const target = workspaceFolder ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+  const target = getConfigurationTarget();
   const configuration = vscode.workspace.getConfiguration('postgresSchemaCompare');
 
   await configuration.update('host', config.host.trim(), target);
@@ -37,4 +36,26 @@ export async function updateExtensionConfig(config: ExtensionConfig): Promise<vo
   await configuration.update('username', config.username.trim(), target);
   await configuration.update('password', config.password, target);
   await configuration.update('schemaFolder', config.schemaFolder.trim(), target);
+}
+
+export async function updateSchemaFolder(schemaFolder: string): Promise<void> {
+  await vscode.workspace.getConfiguration('postgresSchemaCompare')
+    .update('schemaFolder', schemaFolder.trim(), getConfigurationTarget());
+}
+
+export async function removeConnectionConfig(): Promise<void> {
+  const configuration = vscode.workspace.getConfiguration('postgresSchemaCompare');
+  const target = getConfigurationTarget();
+
+  await configuration.update('host', '', target);
+  await configuration.update('port', 5432, target);
+  await configuration.update('database', '', target);
+  await configuration.update('username', '', target);
+  await configuration.update('password', '', target);
+}
+
+function getConfigurationTarget(): vscode.ConfigurationTarget {
+  return vscode.workspace.workspaceFolders?.length
+    ? vscode.ConfigurationTarget.Workspace
+    : vscode.ConfigurationTarget.Global;
 }

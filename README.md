@@ -1,74 +1,73 @@
 # PostgreSQL Schema Compare
 
-PostgreSQL Schema Compare is a Visual Studio Code extension for comparing and synchronizing PostgreSQL schema objects with local SQL files.
+Compare a live PostgreSQL database with local SQL files, review the differences, and sync either side from Visual Studio Code.
 
-It provides a database object explorer, local-vs-live diff views, full folder comparison, migration plan generation, and guarded update actions for keeping a schema folder and a live PostgreSQL database in sync.
+## Workflows
 
-## Features
+### 1. Configure, explore, and write schema files
 
-- Configure PostgreSQL connection settings from the extension sidebar.
-- Browse schemas, tables, views, materialized views, indexes, functions, procedures, sequences, triggers, and types in the **Database Objects** view.
-- Compare a local `.sql` file with the live database definition.
-- Compare an object from the sidebar with its matching local schema file.
-- Compare the whole schema folder with the live database in the **Schema Folder vs Database** view.
-- Filter folder differences by schema, object type, and status, with filter-aware bulk actions.
-- Show detailed change summaries for folder comparison rows and per-folder diff counts in the object explorer.
-- Generate a migration plan for one difference or all folder differences.
-- Update the schema folder from the database.
-- Update the live database from local SQL using generated migration plans.
-- Write/export database objects to the schema folder.
-- Reveal configured schema folders and object folders in the OS file explorer.
+Choose a schema folder, enter and test your PostgreSQL connection, then save the settings. Browse schemas and objects in **Database Objects** and select **Write Database to Folder** to create local SQL files.
 
-## What's New in v0.2.0
+![PostgreSQL compare for Visual Studio Code](img/initial.gif)
 
-- Added persistent schema, object-type, and status filters to folder comparisons. Bulk actions apply only to the changes shown by the active filters.
-- Added schema-level folder comparison so local schema folders missing from the database appear as local-only differences and can generate `CREATE SCHEMA IF NOT EXISTS` migration steps.
-- Improved explorer performance with lazy, cached comparisons, per-folder diff counts, and targeted refreshes after synchronization.
-- Added dependency-safe migration phases for local-only types, standalone sequences, tables, and foreign keys.
-- Excluded constraint-backed indexes, table-owned indexes, identity-owned sequences, and database sequences owned by table columns from standalone object differences.
-- Improved PostgreSQL routine handling by preserving routine bodies and ensuring function and procedure statements are correctly terminated when exported, compared, planned, or executed.
-- Treated `varchar`/`character varying` and `char`/`character` as equivalent column type aliases to avoid false differences.
+### 2. Compare, review a migration plan, and update
 
-## Requirements
+Open **Schema Folder vs Database** to inspect differences. Compare an object, preview its migration SQL, or update the folder or live database.
 
-- Visual Studio Code `1.90.0` or newer.
-- A reachable PostgreSQL database.
-- A workspace folder, unless `postgresSchemaCompare.schemaFolder` is configured as an absolute path.
+![Schema Folder vs Database](img/compare-and-update.gif)
 
-## Configuration
+## Quick start
 
-Open the PostgreSQL Schema Compare sidebar and select **Configure Connection**.
+1. Open the **PostgreSQL Schema Compare** activity bar view and select **Configure Connection**.
+2. Enter the host, port, database, username, and password. Choose a local **Schema folder** with the folder button, or type its path. Selecting a folder saves that path immediately; typed paths and database details are saved with **Save Settings**.
+3. Select **Test Connection**, then **Save Settings**. The database appears in **Database Objects**.
+4. Select **Write Database to Folder** from the view title or the database's right-click menu to create local `.sql` files.
+5. Select **Compare Folder with Database** from the view title to review the whole folder against the live database.
 
-The extension stores these settings:
+The folder picker starts in your home directory. You can navigate to any folder; choosing another folder replaces the saved schema folder path.
 
-| Setting | Description |
+## What you can do
+
+| Action | Result |
 | --- | --- |
-| `postgresSchemaCompare.host` | PostgreSQL server host. |
-| `postgresSchemaCompare.port` | PostgreSQL server port. Defaults to `5432`. |
-| `postgresSchemaCompare.database` | Database name. |
-| `postgresSchemaCompare.username` | PostgreSQL username. |
-| `postgresSchemaCompare.password` | PostgreSQL password. Prefer workspace-local settings outside source control. |
-| `postgresSchemaCompare.schemaFolder` | Relative or absolute folder used for local schema files. |
+| **Write Database to Folder** | Export supported database objects into the configured schema folder. Matching files are overwritten after confirmation. |
+| **Compare with Live Database** | Open a VS Code diff for a local `.sql` file or a database object. |
+| **Compare Folder with Database** | Open the comparison webview for every supported object in the folder and database. |
+| **Migration Plan** | Preview generated SQL for one difference or all visible actionable differences. |
+| **Update Folder** | Change local files to match the live database. |
+| **Update Database** | Apply local SQL or a generated migration plan to the live database. |
 
-## Supported Object Types
+The comparison view filters by schema, object type, and status. Its bulk actions apply to the differences currently shown by those filters. Each row has its own **Compare**, **Migration Plan**, **Update Folder**, and **Update Database** actions where applicable. After an update, completed rows are removed and affected explorer folders refresh.
 
-It supports these PostgreSQL object types in the object explorer, folder comparison, export, and migration plan flows:
+### Compare an individual object
 
-| Object type | Folder name |
-| --- | --- |
-| Tables | `Tables` |
-| Views | `Views` |
-| Materialized views | `Materialized Views` |
-| Indexes | `Indexes` |
-| Functions | `Functions` |
-| Procedures | `Procedures` |
-| Sequences | `Sequences` |
-| Triggers | `Triggers` |
-| Types | `Types` |
+- Right-click a local `.sql` file in the VS Code file explorer and select **Compare with Live Database**.
+- Select or right-click an object in **Database Objects** and choose **Compare with Live Database**.
+- From an open diff, use the editor title actions to **Swap Compare Direction**, **Update Folder from Live Database**, or **Update Live Database from Folder**.
 
-## Schema Folder Layout
+Tables use a table-aware comparison, so changing only the order of columns does not create a difference.
 
-Preferred layout:
+### Browse and manage the connection
+
+**Database Objects** groups tables, views, materialized views, indexes, functions, procedures, sequences, triggers, and types by schema. Open a schema and object folder to load comparison results. Object folders show `no diff` and `diff` counts; objects can show `same`, `modified`, `missing local`, `local only`, or `compare error`.
+
+Right-click the database connection and choose **Remove Connection** to disconnect and clear its saved host, database, username, and password without a prompt. The port resets to `5432`, and the schema folder remains configured. The same action is available on a failed connection row. To connect again, choose **Configure Connection**.
+
+You can also refresh the view or individual object folders from the live database. **Reveal in File Explorer** opens the matching local folder for a connection, schema, object folder, or object.
+
+## Migration plans and update direction
+
+**Update Folder** uses the database definition as the source and changes local files. **Update Database** uses local files as the source and changes the live database. Review the generated SQL before applying a database update.
+
+For modified tables, the standard plan uses `ALTER TABLE` where supported: columns, types, defaults, `NOT NULL`, and named constraints. It handles affected foreign keys by dropping and restoring them around the table changes. Text-like columns changed to `jsonb` use a `USING` clause.
+
+For a modified table, a separate **Drop and Recreate Table** plan is available. It removes table rows and may lose database properties or dependent objects that are absent from local SQL. PostgreSQL can also block the drop when other objects depend on the table. Preview this plan before using its **Update Database** action; the extension asks for data-loss confirmation.
+
+Combined plans create schemas and prerequisite types and sequences before tables and deferred foreign keys where practical. Modified non-table objects use supported drop-and-create plans. The header menu can generate a plan or update all currently visible actionable differences, including the table recreation variant when relevant.
+
+## Local folder layout
+
+The preferred structure is one folder per PostgreSQL schema, then one folder per object type:
 
 ```text
 schema/
@@ -78,143 +77,43 @@ schema/
     Views/
       active_users.sql
     Materialized Views/
-      user_rollups.sql
     Indexes/
-      users_email_idx.sql
     Functions/
-      refresh_user_stats.sql
     Procedures/
-      archive_users.sql
     Sequences/
-      user_id_seq.sql
     Triggers/
-      users_audit_trigger.sql
     Types/
-      user_status.sql
   app/
     Tables/
     Views/
-    Materialized Views/
-    Indexes/
-    Functions/
-    Procedures/
-    Sequences/
-    Triggers/
-    Types/
 ```
 
-Set `postgresSchemaCompare.schemaFolder` to `schema` for the example above.
+Set `postgresSchemaCompare.schemaFolder` to `schema` for this example. Dot-prefixed schema folders and SQL files are ignored during local scans.
 
-Dot-prefixed schema folders and SQL files are ignored during local folder scans.
+## Configuration
 
-## Usage
+Open **Configure Connection** from the extension sidebar. Settings are saved in the current workspace when one is open, or in user settings otherwise.
 
-### Configure and Load the Object Explorer
+| Setting | Purpose |
+| --- | --- |
+| `postgresSchemaCompare.host` | PostgreSQL server host. |
+| `postgresSchemaCompare.port` | PostgreSQL server port; defaults to `5432`. |
+| `postgresSchemaCompare.database` | Database name. |
+| `postgresSchemaCompare.username` | PostgreSQL username. |
+| `postgresSchemaCompare.password` | PostgreSQL password. Keep workspace settings containing passwords out of source control. |
+| `postgresSchemaCompare.schemaFolder` | Local schema folder, as an absolute path or a path relative to the workspace. |
 
-1. Open the **PostgreSQL Schema Compare** activity bar view.
-2. Select **Configure Connection**.
-3. Enter the PostgreSQL connection values and schema folder.
-4. Save and test the connection.
-5. Use **Refresh from Live Database** if you need to reload the sidebar.
+## Requirements
 
-Object comparisons are loaded and cached as schemas and object-type folders are opened. Loaded folders show `no diff` and `diff` counts, and each object shows its comparison status when a schema folder is configured:
-
-- `same`: local file and database object match.
-- `modified`: local file and database object differ.
-- `missing local`: object exists in the database but not in the folder.
-- `local only`: local file exists but the object is not in the database.
-- `compare error`: the object could not be compared.
-
-### Compare One Local File
-
-Right-click a `.sql` file in the VS Code file explorer and select **Compare with Live Database**.
-
-After a diff is open, the editor title actions can:
-
-- **Swap Compare Direction**
-- **Update Folder from Live Database**
-- **Update Live Database from Folder**
-
-### Compare One Sidebar Object
-
-In **Database Objects**, select or right-click a supported object and choose **Compare with Live Database**.
-
-For tables, the comparison is table-aware. Column order alone is ignored, so a reordered table definition is not treated as modified.
-
-### Compare the Whole Folder
-
-Use **Compare Folder with Database** from the object explorer title bar.
-
-The **Schema Folder vs Database** view shows a loading state while comparison is running, an empty state when the folder matches the live database, and an error state when comparison fails. When differences exist, it provides an action dropdown for each row:
-
-- **Compare**: open the VS Code diff view.
-- **Migration Plan**: open the generated SQL plan for that row.
-- **Migration Plan — Drop and Recreate Table**: for a modified table, preview a separate plan that replaces the table from its local SQL definition.
-- **Update Folder**: write the live database definition to the local folder, or delete local-only files after confirmation.
-- **Update Database**: apply the local SQL or generated migration plan to the live database after confirmation.
-- **Update Database — Drop and Recreate Table**: run the replacement plan for a modified table after a data-loss confirmation.
-
-The standard table plan uses `ALTER TABLE`. The separate replacement plan drops modified tables without `CASCADE`, recreates them, and restores local constraints, indexes, triggers, and referencing foreign keys that the plan can identify. It deletes table rows and may lose privileges, comments, or objects missing from local SQL. Other dependent objects can block the drop. Review the generated plan before running this option. **Update Folder** continues to copy database definitions to local files.
-
-The comparison table fills the editor width. Drag a column header edge to resize it; the Action column remains visible while the table scrolls horizontally. Use the schema and object-type dropdowns together with the status buttons to filter the rows. Filter selections are preserved when the comparison view refreshes.
-
-The header action dropdown targets only the currently shown differences:
-
-- **Migration Plan - All Differences**: opens one combined SQL script for all actionable differences.
-- **Migration Plan - Recreate Modified Tables**: previews a combined plan that replaces modified tables and uses the standard migration behavior for other objects.
-- **Update Folder - All Differences**: updates the folder for every actionable difference.
-- **Update Database - All Differences**: generates the full migration plan and executes that script once.
-- **Update Database - Recreate Modified Tables**: runs the combined replacement plan after a data-loss confirmation.
-
-After update actions, completed rows are removed immediately and only affected explorer folders are refreshed where possible. Schema changes trigger a full explorer refresh.
-
-### Write Database to Folder
-
-Use **Write Database to Folder** from the object explorer title bar or connection context menu.
-
-This exports database object definitions into the configured schema folder using the preferred schema layout.
-
-### Reveal in File Explorer
-
-Right-click a connection, schema, object folder, or object in the sidebar and choose **Reveal in File Explorer**.
-
-This opens the matching local folder in the operating system file explorer.
-
-## Migration Plans
-
-For modified tables, the extension tries to generate `ALTER TABLE` statements instead of replacing the table.
-
-Supported table changes include:
-
-- Add columns.
-- Drop columns.
-- Change column type.
-- Set or drop column defaults.
-- Set or drop `NOT NULL`.
-- Add, drop, or replace named constraints.
-
-When changing text-like columns to `jsonb`, generated SQL includes a `USING` clause so PostgreSQL can perform the conversion.
-
-When table key constraints or changed columns affect foreign keys, generated plans drop the affected foreign keys before the table changes and re-add them afterward.
-
-For modified non-table objects, the migration plan replaces the object using drop-and-create style SQL where supported by the extension. Function and procedure definitions are normalized with a terminating semicolon without removing transaction-like text from their bodies.
-
-For local-only objects, combined plans create schemas first, then prerequisite types and standalone sequences, followed by tables and their deferred foreign keys. New-table foreign keys are separated from `CREATE TABLE` statements so referenced tables can be created first.
-
-Combined migration plans are ordered by object type and table dependencies so prerequisite objects are created before dependent objects where practical. Constraint-backed and table-owned indexes are treated as part of their owning table constraints, while identity-owned sequences are treated as part of their table columns; these objects are not reported or migrated as separate local-only differences.
-
-Review generated migration plans before applying them to important databases.
+- Visual Studio Code `1.90.0` or newer.
+- A reachable PostgreSQL database.
+- A workspace folder for a relative schema path. An absolute schema folder path works without an open workspace.
 
 ## Development
 
-Install dependencies:
-
 ```bash
 npm install
+npm test
 ```
 
-Compile:
-
-```bash
-npm run compile
-```
+Use `npm run compile` to compile without running tests. See [changelog.md](changelog.md) for release details.

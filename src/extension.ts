@@ -4,6 +4,7 @@ import { registerCompareFileWithDatabaseCommand } from './commands/compareFileWi
 import { registerCompareFolderWithDatabaseCommand } from './commands/compareFolderWithDatabase';
 import { registerExportDatabaseToFolderCommand } from './commands/exportDatabaseToFolder';
 import { registerOpenConnectionSettingsCommand } from './commands/openConnectionSettings';
+import { registerRemoveConnectionCommand } from './commands/removeConnection';
 import { registerRevealObjectInExplorerCommand } from './commands/revealObjectInExplorer';
 import { registerSwapDiffDirectionCommand } from './commands/swapDiffDirection';
 import { registerSyncActiveDiffCommands } from './commands/syncActiveDiff';
@@ -40,6 +41,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   registerOpenConnectionSettingsCommand(context);
+  registerRemoveConnectionCommand(context, () => databaseObjectsProvider.refresh());
   registerCompareFileWithDatabaseCommand(context, serviceFactory, diffSessionState);
   registerSwapDiffDirectionCommand(context, serviceFactory, diffSessionState);
   registerSyncActiveDiffCommands(
