@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.3.0
+
+Feature and reliability update.
+
+- Add separate preview and update actions to drop and recreate modified tables, both individually and in combined migration plans. The existing table update action continues to use `ALTER TABLE`.
+- Rebuild locally defined table constraints, indexes, triggers, and identifiable referencing foreign keys in recreation plans. Show a data-loss confirmation before applying these plans; table rows, privileges, comments, and objects absent from local SQL may be lost, and external dependencies may block the drop.
+- Make the folder comparison table fill the editor, allow column resizing, keep the Action column visible during horizontal scrolling, and preserve column widths and scroll position when the view refreshes.
+- Order combined migration plans by object dependencies, with separate phases for dropping dependents, creating prerequisite types and sequences, creating tables, and restoring routines, indexes, views, and triggers.
+- Alter modified sequences in place and recheck local-only sequences against the live database when catalog discovery omits owned sequences, avoiding duplicate `CREATE SEQUENCE` statements.
+- Ignore SQL comments and an optional final semicolon when comparing definitions, and add missing statement terminators before trailing comments in executable SQL.
+- Use one confirmation for bulk folder updates, and store the full path selected by the schema folder picker.
+- Add automated tests for migration plans and SQL text handling, and update the extension debug build task.
+
 ## v0.2.0
 
 Major update.
