@@ -3,6 +3,7 @@ import { SchemaObjectKind, SchemaObjectRef } from '../model/schemaObject';
 import { PostgresSchemaService } from './postgresSchemaService';
 import { SchemaFileService } from './schemaFileService';
 import { ensureSqlStatementTerminator, normalizeSqlForComparison, stripSqlComments } from './sqlTextUtils';
+import { normalizeDefinition, normalizeForeignKeyDefinition, normalizeIdentityClause, stripMatchingRoutineDrop } from './definitionNormalization';
 
 export interface PreparedSchemaDiff {
   readonly leftUri: vscode.Uri;
@@ -816,13 +817,13 @@ function ensureTrailingNewline(value: string): string {
 
 export function areDefinitionsEquivalent(ref: SchemaObjectRef, liveSql: string, localSql: string): boolean {
   if (ref.kind !== 'table') {
-    return normalizeSqlForComparison(liveSql) === normalizeSqlForComparison(localSql);
+    return normalizeDefinition(ref.kind, liveSql) === normalizeDefinition(ref.kind, localSql);
   }
 
   try {
     return areTableDefinitionsEquivalent(stripSqlComments(liveSql), stripSqlComments(localSql));
   } catch {
-    return normalizeSqlForComparison(liveSql) === normalizeSqlForComparison(localSql);
+    return normalizeDefinition(ref.kind, liveSql) === normalizeDefinition(ref.kind, localSql);
   }
 }
 
@@ -932,13 +933,18 @@ function areMapsEquivalent<T>(
 
 function areColumnsEquivalent(left: ParsedColumn, right: ParsedColumn): boolean {
   return normalizeColumnType(left.type) === normalizeColumnType(right.type)
-    && normalizeSqlFragment(left.defaultValue ?? '') === normalizeSqlFragment(right.defaultValue ?? '')
+    && normalizeDefinition('type', left.defaultValue ?? '') === normalizeDefinition('type', right.defaultValue ?? '')
     && left.notNull === right.notNull
-    && normalizeSqlFragment(left.identity ?? '') === normalizeSqlFragment(right.identity ?? '');
+    && normalizeIdentityClause(left.identity ?? '', normalizeColumnType(left.type))
+      === normalizeIdentityClause(right.identity ?? '', normalizeColumnType(right.type));
 }
 
 function areConstraintsEquivalent(left: ParsedConstraint, right: ParsedConstraint): boolean {
-  return normalizeSqlFragment(left.definition) === normalizeSqlFragment(right.definition);
+  if (left.kind !== right.kind) { return false; }
+  if (left.kind === 'foreignKey') {
+    return normalizeForeignKeyDefinition(left.definition) === normalizeForeignKeyDefinition(right.definition);
+  }
+  return normalizeDefinition('type', left.definition) === normalizeDefinition('type', right.definition);
 }
 
 function describeTableDefinitionChanges(liveSql: string, localSql: string): string {
@@ -993,7 +999,7 @@ function describeColumnChanges(liveColumn: ParsedColumn, localColumn: ParsedColu
     changes.push(`type ${liveColumn.type} -> ${localColumn.type}`);
   }
 
-  if (normalizeSqlFragment(liveColumn.defaultValue ?? '') !== normalizeSqlFragment(localColumn.defaultValue ?? '')) {
+  if (normalizeDefinition('type', liveColumn.defaultValue ?? '') !== normalizeDefinition('type', localColumn.defaultValue ?? '')) {
     changes.push(`default ${formatOptionalSqlValue(liveColumn.defaultValue)} -> ${formatOptionalSqlValue(localColumn.defaultValue)}`);
   }
 
@@ -1001,7 +1007,8 @@ function describeColumnChanges(liveColumn: ParsedColumn, localColumn: ParsedColu
     changes.push(localColumn.notNull ? 'set NOT NULL' : 'drop NOT NULL');
   }
 
-  if (normalizeSqlFragment(liveColumn.identity ?? '') !== normalizeSqlFragment(localColumn.identity ?? '')) {
+  if (normalizeIdentityClause(liveColumn.identity ?? '', normalizeColumnType(liveColumn.type))
+    !== normalizeIdentityClause(localColumn.identity ?? '', normalizeColumnType(localColumn.type))) {
     changes.push(`identity ${formatOptionalSqlValue(liveColumn.identity)} -> ${formatOptionalSqlValue(localColumn.identity)}`);
   }
 
@@ -1048,6 +1055,8 @@ function createNewTableMigrationPlanPhases(
   const closeIndex = findMatchingCloseParenthesis(localSql, openIndex);
   const retainedParts: string[] = [];
   const foreignKeys: ParsedConstraint[] = [];
+  const otherConstraints: ParsedConstraint[] = [];
+  const trailingConstraints = getTrailingTableConstraints(localSql, closeIndex);
 
   for (const part of splitTopLevelComma(localSql.slice(openIndex + 1, closeIndex))) {
     const raw = part.trim();
@@ -1063,15 +1072,32 @@ function createNewTableMigrationPlanPhases(
     retainedParts.push(raw);
   }
 
+  for (const statement of trailingConstraints) {
+    if (statement.constraint.kind === 'foreignKey') {
+      foreignKeys.push(statement.constraint);
+    } else {
+      otherConstraints.push(statement.constraint);
+    }
+  }
+
+  let withoutTrailingConstraints = localSql;
+  for (const statement of [...trailingConstraints].reverse()) {
+    withoutTrailingConstraints = withoutTrailingConstraints.slice(0, statement.start)
+      + withoutTrailingConstraints.slice(statement.end);
+  }
+
   const createTableSql = [
-    `${localSql.slice(0, openIndex + 1).trimEnd()}`,
+    `${withoutTrailingConstraints.slice(0, openIndex + 1).trimEnd()}`,
     retainedParts.map((part) => `  ${part}`).join(',\n'),
-    `${localSql.slice(closeIndex).trimStart()}`
+    `${withoutTrailingConstraints.slice(closeIndex).trimStart()}`
   ].join('\n').trim();
   const tableName = getQualifiedName(ref);
 
   return createMigrationPlanPhases({
     createTables: [ensureSqlStatementTerminator(createTableSql)],
+    addPrimaryUniqueCheckConstraints: otherConstraints.flatMap((constraint) =>
+      createAddConstraintStatements(ref, tableName, constraint.name, constraint, localTables)
+    ),
     addForeignKeys: foreignKeys.flatMap((constraint) =>
       createAddConstraintStatements(ref, tableName, constraint.name, constraint, localTables)
     )
@@ -1100,7 +1126,7 @@ function createTableMigrationPlanPhases(
 
     if (
       !localConstraint ||
-      normalizeSqlFragment(localConstraint.raw) !== normalizeSqlFragment(liveConstraint.raw) ||
+      !areConstraintsEquivalent(localConstraint, liveConstraint) ||
       doesConstraintUseAnyColumn(liveConstraint, changedColumns)
     ) {
       getDropConstraintPhase(phases, liveConstraint).push(`ALTER TABLE ${tableName} DROP CONSTRAINT IF EXISTS ${quoteIdentifier(name)};`);
@@ -1130,7 +1156,7 @@ function createTableMigrationPlanPhases(
 
     if (
       !liveConstraint ||
-      normalizeSqlFragment(localConstraint.raw) !== normalizeSqlFragment(liveConstraint.raw) ||
+      !areConstraintsEquivalent(localConstraint, liveConstraint) ||
       droppedConstraints.has(name) ||
       doesConstraintUseAnyColumn(localConstraint, changedColumns)
     ) {
@@ -1168,7 +1194,7 @@ function hasReferencedKeyConstraintChanges(liveTable: ParsedTableDefinition, loc
       return true;
     }
 
-    if (normalizeSqlFragment(liveConstraint.raw) !== normalizeSqlFragment(localConstraint.raw)) {
+    if (!areConstraintsEquivalent(liveConstraint, localConstraint)) {
       return true;
     }
   }
@@ -1224,17 +1250,18 @@ function createColumnAlterStatements(tableName: string, liveColumn: ParsedColumn
   const statements: string[] = [];
   const columnName = quoteIdentifier(localColumn.name);
 
-  if (normalizeSqlFragment(liveColumn.identity ?? '') !== normalizeSqlFragment(localColumn.identity ?? '')) {
+  if (normalizeIdentityClause(liveColumn.identity ?? '', normalizeColumnType(liveColumn.type))
+    !== normalizeIdentityClause(localColumn.identity ?? '', normalizeColumnType(localColumn.type))) {
     throw new Error(`Column ${localColumn.name} changes identity generation, which cannot be migrated safely yet.`);
   }
 
-  if (normalizeSqlFragment(liveColumn.type) !== normalizeSqlFragment(localColumn.type)) {
+  if (normalizeColumnType(liveColumn.type) !== normalizeColumnType(localColumn.type)) {
     statements.push(
       `ALTER TABLE ${tableName} ALTER COLUMN ${columnName} TYPE ${localColumn.type}${getTypeMigrationUsingClause(columnName, liveColumn, localColumn)};`
     );
   }
 
-  if (normalizeSqlFragment(liveColumn.defaultValue ?? '') !== normalizeSqlFragment(localColumn.defaultValue ?? '')) {
+  if (normalizeDefinition('type', liveColumn.defaultValue ?? '') !== normalizeDefinition('type', localColumn.defaultValue ?? '')) {
     statements.push(
       localColumn.defaultValue
         ? `ALTER TABLE ${tableName} ALTER COLUMN ${columnName} SET DEFAULT ${localColumn.defaultValue};`
@@ -1463,8 +1490,10 @@ function createExecutableObjectSql(ref: SchemaObjectRef, sql: string): string {
   let executableSql = stripSqlComments(sql).trim();
 
   if (ref.kind === 'function') {
+    executableSql = stripMatchingRoutineDrop(ref.kind, executableSql);
     executableSql = addOrReplaceClause(executableSql, 'FUNCTION');
   } else if (ref.kind === 'procedure') {
+    executableSql = stripMatchingRoutineDrop(ref.kind, executableSql);
     executableSql = addOrReplaceClause(executableSql, 'PROCEDURE');
   } else if (ref.kind === 'view') {
     executableSql = addOrReplaceClause(executableSql, 'VIEW');
@@ -1585,17 +1614,61 @@ function parseCreateTableDefinition(sql: string): ParsedTableDefinition {
     columns.set(column.name, column);
   }
 
+  for (const statement of getTrailingTableConstraints(sql, closeIndex)) {
+    constraints.set(statement.constraint.name, statement.constraint);
+  }
+
   return { columns, constraints };
+}
+
+function getTrailingTableConstraints(sql: string, closeIndex: number): Array<{ readonly start: number; readonly end: number; readonly constraint: ParsedConstraint }> {
+  const header = /^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?/i.exec(sql);
+  if (!header) { return []; }
+  const table = readQualifiedRelationName(sql.slice(header[0].length));
+  const statements: Array<{ readonly start: number; readonly end: number; readonly constraint: ParsedConstraint }> = [];
+  const tail = sql.slice(closeIndex + 1);
+  const alterPattern = /^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?/gim;
+  for (const match of tail.matchAll(alterPattern)) {
+    const start = closeIndex + 1 + match.index;
+    const afterKeyword = sql.slice(start + match[0].length);
+    const relation = readQualifiedRelationName(afterKeyword);
+    if (relation.table !== table.table || relation.schema !== table.schema) { continue; }
+    const afterRelation = afterKeyword.slice(relation.endIndex);
+    if (!/^\s+ADD\s+CONSTRAINT\s+/i.test(afterRelation)) { continue; }
+    const terminator = findUnquotedSemicolon(afterRelation);
+    const end = terminator < 0 ? sql.length : start + match[0].length + relation.endIndex + terminator + 1;
+    const definition = afterRelation.slice(0, terminator < 0 ? undefined : terminator).replace(/^\s*ADD\s+/i, '').trim();
+    statements.push({ start, end, constraint: parseConstraintDefinition(definition) });
+  }
+  return statements;
+}
+
+function findUnquotedSemicolon(sql: string): number {
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < sql.length; index += 1) {
+    const char = sql[index];
+    if (quote) {
+      if (char === quote && sql[index + 1] === quote) { index += 1; }
+      else if (char === quote) { quote = undefined; }
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (char === ';') {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function parseColumnDefinition(raw: string): ParsedColumn {
   const identifier = readIdentifier(raw);
   const definition = raw.slice(identifier.endIndex).trim();
-  const defaultIndex = findTopLevelKeyword(definition, 'DEFAULT');
   const notNullIndex = findTopLevelKeyword(definition, 'NOT NULL');
   const identityAlwaysIndex = findTopLevelKeyword(definition, 'GENERATED ALWAYS AS IDENTITY');
   const identityDefaultIndex = findTopLevelKeyword(definition, 'GENERATED BY DEFAULT AS IDENTITY');
   const identityIndex = minDefined(identityAlwaysIndex, identityDefaultIndex);
+  // DEFAULT in GENERATED BY DEFAULT AS IDENTITY is part of the identity clause,
+  // not a separate column DEFAULT expression.
+  const defaultIndex = identityDefaultIndex === undefined ? findTopLevelKeyword(definition, 'DEFAULT') : undefined;
   const typeEnd = minDefined(defaultIndex, notNullIndex, identityIndex) ?? definition.length;
   const type = definition.slice(0, typeEnd).trim();
 
@@ -1961,6 +2034,8 @@ function normalizeTypeName(value: string): string {
 
 function normalizeColumnType(value: string): string {
   return normalizeSqlFragment(value)
+    .replace(/\s+collate\s+pg_catalog\."default"$/, '')
+    .replace(/\s+collate\s+"default"$/, '')
     .replace(/^varchar(?=\s|\(|$)/, 'character varying')
     .replace(/^char(?=\s|\(|$)/, 'character');
 }
