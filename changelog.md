@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.1
+
+Bug fix.
+
+- Add missing semicolons between statements in multi-statement schema scripts, including pgAdmin table scripts that place an `ALTER SEQUENCE` after `CREATE TABLE`.
+
 ## v0.3.0
 
 Feature and reliability update.

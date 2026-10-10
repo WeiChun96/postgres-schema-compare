@@ -54,3 +54,54 @@ test('does not mistake semicolons in strings or dollar-quoted bodies for the com
     'CREATE FUNCTION f() RETURNS void AS $$ BEGIN NULL; END $$ LANGUAGE plpgsql;'
   );
 });
+
+test('terminates each statement in a pgAdmin table script', () => {
+  const sql = [
+    'CREATE TABLE IF NOT EXISTS ces.coe_applicant_employment',
+    '(',
+    '  id integer NOT NULL GENERATED ALWAYS AS IDENTITY ( INCREMENT 1 START 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1 ),',
+    '  coe_id uuid NOT NULL,',
+    '  CONSTRAINT pk_coe_applicant_employment PRIMARY KEY (id)',
+    ') ',
+    '',
+    'ALTER SEQUENCE ces.seq_coe_applicant_employment_id',
+    'RENAME TO seq_coe_applicant_employment;'
+  ].join('\n');
+  const expected = sql.replace(') \n\nALTER SEQUENCE', '); \n\nALTER SEQUENCE');
+
+  assert.equal(ensureSqlStatementTerminator(sql), expected);
+  assert.equal(ensureSqlStatementTerminator(expected), expected);
+});
+
+test('terminates multiple DDL statements without changing quoted bodies or trailing comments', () => {
+  const sql = [
+    'CREATE FUNCTION public.f() RETURNS text AS $body$',
+    'BEGIN',
+    "  RETURN 'ALTER TABLE t';",
+    'END',
+    '$body$ LANGUAGE plpgsql -- function ends here',
+    'ALTER TABLE public.t ADD COLUMN label text',
+    'COMMENT ON COLUMN public.t.label IS \';\' -- final comment'
+  ].join('\n');
+
+  assert.equal(
+    ensureSqlStatementTerminator(sql),
+    sql.replace('LANGUAGE plpgsql --', 'LANGUAGE plpgsql; --')
+      .replace('ADD COLUMN label text\n', 'ADD COLUMN label text;\n')
+      .replace("IS ';' --", "IS ';'; --")
+  );
+});
+
+test('keeps multiline ALTER TABLE clauses within one statement', () => {
+  const sql = [
+    'ALTER TABLE public.t',
+    '  ALTER COLUMN label TYPE text,',
+    '  ADD COLUMN note text',
+    'CREATE INDEX t_note_idx ON public.t (note)'
+  ].join('\n');
+
+  assert.equal(
+    ensureSqlStatementTerminator(sql),
+    sql.replace('ADD COLUMN note text\n', 'ADD COLUMN note text;\n') + ';'
+  );
+});

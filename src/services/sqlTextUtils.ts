@@ -11,23 +11,31 @@ export function normalizeSqlForComparison(sql: string): string {
 }
 
 export function ensureSqlStatementTerminator(sql: string): string {
-  const { lastCodeIndex } = scanSql(sql);
+  const { lastCodeIndex, missingTerminatorIndexes } = scanSql(sql);
 
-  if (lastCodeIndex === undefined || sql[lastCodeIndex] === ';') {
-    return sql;
+  if (lastCodeIndex !== undefined && sql[lastCodeIndex] !== ';') {
+    missingTerminatorIndexes.push(lastCodeIndex + 1);
   }
 
-  return `${sql.slice(0, lastCodeIndex + 1)};${sql.slice(lastCodeIndex + 1)}`;
+  for (const index of missingTerminatorIndexes.reverse()) {
+    sql = `${sql.slice(0, index)};${sql.slice(index)}`;
+  }
+
+  return sql;
 }
 
 interface SqlScanResult {
   readonly withoutComments: string;
   readonly lastCodeIndex?: number;
+  readonly missingTerminatorIndexes: number[];
 }
 
 function scanSql(sql: string): SqlScanResult {
   let withoutComments = '';
   let lastCodeIndex: number | undefined;
+  const missingTerminatorIndexes: number[] = [];
+  let parenthesisDepth = 0;
+  let lineStart = true;
 
   for (let index = 0; index < sql.length;) {
     if (sql.startsWith('--', index)) {
@@ -43,10 +51,19 @@ function scanSql(sql: string): SqlScanResult {
 
     if (sql.startsWith('/*', index)) {
       withoutComments += ' ';
+      const commentStart = index;
       index = copyBlockCommentNewlines(sql, index + 2, (value) => {
         withoutComments += value;
       });
+      if (/[\r\n]/.test(sql.slice(commentStart, index))) {
+        lineStart = true;
+      }
       continue;
+    }
+
+    if (lineStart && parenthesisDepth === 0 && lastCodeIndex !== undefined && sql[lastCodeIndex] !== ';'
+      && /^(?:CREATE|ALTER\s+(?!COLUMN\b)|DROP|COMMENT|GRANT|REVOKE|TRUNCATE|DO|CALL)\b/i.test(sql.slice(index))) {
+      missingTerminatorIndexes.push(lastCodeIndex + 1);
     }
 
     const dollarQuote = readDollarQuoteDelimiter(sql, index);
@@ -55,6 +72,7 @@ function scanSql(sql: string): SqlScanResult {
       const tokenEndIndex = endIndex === -1 ? sql.length : endIndex + dollarQuote.length;
       withoutComments += sql.slice(index, tokenEndIndex);
       lastCodeIndex = tokenEndIndex - 1;
+      lineStart = false;
       index = tokenEndIndex;
       continue;
     }
@@ -66,6 +84,7 @@ function scanSql(sql: string): SqlScanResult {
         withoutComments += value;
       });
       lastCodeIndex = tokenEndIndex - 1;
+      lineStart = false;
       index = tokenEndIndex;
       continue;
     }
@@ -74,12 +93,20 @@ function scanSql(sql: string): SqlScanResult {
 
     if (!/\s/.test(char)) {
       lastCodeIndex = index;
+      lineStart = false;
+      if (char === '(') {
+        parenthesisDepth += 1;
+      } else if (char === ')') {
+        parenthesisDepth = Math.max(0, parenthesisDepth - 1);
+      }
+    } else if (char === '\n' || char === '\r') {
+      lineStart = true;
     }
 
     index += 1;
   }
 
-  return { withoutComments, lastCodeIndex };
+  return { withoutComments, lastCodeIndex, missingTerminatorIndexes };
 }
 
 function copyBlockCommentNewlines(sql: string, startIndex: number, append: (value: string) => void): number {

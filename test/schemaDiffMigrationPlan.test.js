@@ -131,6 +131,21 @@ test('apply-all plans create prerequisites and dependents in explicit phases', a
   assert.match(sql, /CREATE OR REPLACE VIEW public\.item_view/);
 });
 
+test('new-table migration separates a following sequence statement from CREATE TABLE', async () => {
+  const localSql = [
+    'CREATE TABLE IF NOT EXISTS public.item (',
+    '  id integer GENERATED ALWAYS AS IDENTITY',
+    ')',
+    '',
+    'ALTER SEQUENCE public.item_id_seq RENAME TO item_seq;'
+  ].join('\n');
+  const { service, getExecutedSql } = createService({ 'table:item': localSql });
+
+  await service.updateDatabaseFromFolder(object('table', 'item'));
+
+  assert.match(getExecutedSql(), /CREATE TABLE IF NOT EXISTS public\.item \([\s\S]*?\);\s+ALTER SEQUENCE public\.item_id_seq RENAME TO item_seq;/);
+});
+
 test('apply-all plans drops in reverse dependency order', async () => {
   const { service, getExecutedSql } = createService({});
   const kinds = ['type', 'sequence', 'table', 'function', 'index', 'view', 'trigger'];
