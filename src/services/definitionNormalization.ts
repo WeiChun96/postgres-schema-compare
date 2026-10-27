@@ -166,13 +166,52 @@ export function normalizeIdentityClause(value: string, type: string): string {
   if (open < 0 || tokens[tokens.length - 1] !== ')') {
     return JSON.stringify(tokens);
   }
-  const options = tokens.slice(open + 1, -1);
+  const identityOptions = splitIdentitySequenceName(tokens.slice(open + 1, -1));
+  if (!identityOptions) { return JSON.stringify(tokens); }
   const sequenceType = type === 'smallint' || type === 'integer' ? type : 'bigint';
-  const normalizedOptions = normalizeSequenceOptions(options, sequenceType);
+  const normalizedOptions = normalizeSequenceOptions(identityOptions.options, sequenceType);
   // The identity sequence inherits the column's integer type.
   const defaults = normalizeSequenceOptions([], sequenceType);
   if (normalizedOptions === undefined) { return JSON.stringify(tokens); }
-  return JSON.stringify(tokens.slice(0, open).concat(normalizedOptions === defaults ? [] : [normalizedOptions]));
+  return JSON.stringify(tokens.slice(0, open).concat(
+    identityOptions.name ? [JSON.stringify(identityOptions.name)] : [],
+    normalizedOptions === defaults ? [] : [normalizedOptions]
+  ));
+}
+
+export function getIdentitySequenceName(value: string): { readonly schema?: string; readonly name: string } | undefined {
+  const tokens = tokenize(value, false);
+  const open = tokens.indexOf('(');
+  if (open < 0 || tokens[tokens.length - 1] !== ')') { return undefined; }
+  const identityOptions = splitIdentitySequenceName(tokens.slice(open + 1, -1));
+  if (!identityOptions?.name) { return undefined; }
+  const identifiers = identityOptions.name.filter((token) => token !== '.');
+  return {
+    schema: identifiers.length === 2 ? decodeIdentifier(identifiers[0]) : undefined,
+    name: decodeIdentifier(identifiers[identifiers.length - 1])
+  };
+}
+
+function splitIdentitySequenceName(tokens: string[]): { readonly options: string[]; readonly name?: string[] } | undefined {
+  const index = tokens.findIndex((token, position) => token === 'sequence' && tokens[position + 1] === 'name');
+  if (index < 0) { return { options: tokens }; }
+  const first = tokens[index + 2];
+  if (!isIdentifierToken(first)) { return undefined; }
+  const name = [first];
+  if (tokens[index + 3] === '.') {
+    const second = tokens[index + 4];
+    if (!isIdentifierToken(second)) { return undefined; }
+    name.push('.', second);
+  }
+  return { options: tokens.slice(0, index).concat(tokens.slice(index + 2 + name.length)), name };
+}
+
+function isIdentifierToken(value: string | undefined): value is string {
+  return value !== undefined && (/^[a-z_][a-z_0-9$]*$/.test(value) || /^"(?:[^"]|"")+"$/.test(value));
+}
+
+function decodeIdentifier(value: string): string {
+  return value.startsWith('"') ? value.slice(1, -1).replace(/""/g, '"') : value;
 }
 
 export function normalizeForeignKeyDefinition(value: string): string {

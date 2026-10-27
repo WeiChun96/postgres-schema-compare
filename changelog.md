@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.3
+
+Bug fix.
+
+- Preserve custom identity sequence names in generated `CREATE TABLE` scripts using PostgreSQL catalog metadata, while allowing columns with automatically named sequences to omit `SEQUENCE NAME`.
+- Compare identity columns with or without an explicit sequence name, and recognize inline primary keys and the `TIMESTAMP` type alias in table definitions.
+- Recognize explicitly named identity sequences as table-owned objects during folder comparison.
+
 ## v0.3.2
 
 Bug fix.
